@@ -1,11 +1,11 @@
 
 # custom config
-ROOT="/vhome/user/dataset"
+ROOT="/home/dji/Project/ODE-Prompt/Adversarial-Prompt-Tuning/Data"
 TRAINER=AdvPT
 # oxford_flowers, oxford_pets, imagenet, food101, sun397, dtd, eurosat, ucf101
-DATASET=oxford_flowers
+DATASET=oxford_pets
 # rn50, vit_b16, vit_l14
-CFG=vit_l14 # config file
+CFG=vit_b16 # config file
 CTP=end  # class token position (end or middle)
 NCTX=32  # number of context tokens
 #SHOTS=16  # number of shots (1, 2, 4, 8, 16)
@@ -14,9 +14,10 @@ CSC=False  # class-specific context (False or True)
 D=$ROOT
 SEED=1
 
-DIR=/share/test/user/share1/new/${DATASET}/${TRAINER}/${CFG}/adv
+DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv
+PYTHON="/home/dji/Project/ODE-Prompt/dassl/bin/python"
 echo "--------------------------------------------------------------------------------------"
-python train.py \
+$PYTHON train.py \
 --root ${D} \
 --adv-training \
 --seed ${SEED} \
@@ -32,13 +33,13 @@ TRAINER.ADV.CSC ${CSC}
 
 
 
-echo "--------------------------------------------------------------------------------------"
-echo "zero shot"
-TRAINER=ZeroshotCLIP
-python train.py \
---root ${D} \
---trainer ${TRAINER} \
---dataset-config-file configs/datasets/${DATASET}.yaml \
---config-file configs/trainers/AdvPT/${CFG}.yaml \
---output-dir output/${TRAINER}/${CFG}/${DATASET} \
---eval-only
+# echo "--------------------------------------------------------------------------------------"
+# echo "zero shot"
+# TRAINER=ZeroshotCLIP
+# python train.py \
+# --root ${D} \
+# --trainer ${TRAINER} \
+# --dataset-config-file configs/datasets/${DATASET}.yaml \
+# --config-file configs/trainers/AdvPT/${CFG}.yaml \
+# --output-dir output/${TRAINER}/${CFG}/${DATASET} \
+# --eval-only

@@ -11,11 +11,17 @@ from dass.engine import TRAINER_REGISTRY, TrainerX
 from dass.metrics import compute_accuracy
 from dass.utils import load_pretrained_weights, load_checkpoint
 from dass.optim import build_optimizer, build_lr_scheduler
+from torchdiffeq import odeint_adjoint as odeint
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 _tokenizer = _Tokenizer()
+
+# ============================================================================
+# ODE-Prompt: 连续时间对抗提示学习
+# 核心思想: dp(t)/dt = f_θ(p(t), z_v)，其中 z_v 是对抗图像的视觉特征
+# ============================================================================
 
 
 # CUSTOM_TEMPLATES = {
@@ -39,7 +45,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/vhome/user/.cache/clip/')
+    model_path = clip._download(url, '/home/dji/Project/ODE-Prompt/Adversarial-Prompt-Tuning/clip')
 
     try:
         # loading JIT archive
@@ -77,43 +83,160 @@ class TextEncoder(nn.Module):
         return x
 
 
+class ODEFunc(nn.Module):
+    """
+    ODE 动力学网络 f_θ
+    
+    根据论文公式 (3.2):
+        dp(t)/dt = f_θ(p(t), z_v)
+    
+    其中:
+        - p(t): 当前时刻的提示状态，形状 (n_ctx, dim)
+        - z_v: 对抗图像的视觉特征，形状 (batch_size, dim)
+        
+    网络设计:
+        f_θ(p, z_v) = MLP_θ([p; z_v])  # 论文公式
+        
+    为了处理 batch 维度的不匹配，我们采用以下策略:
+        - 在训练时，z_v 的 batch 均值作为全局视觉条件
+        - 这样 ODE 为所有类别生成统一的提示演化
+    """
+    def __init__(self, prompt_dim, visual_dim):
+        super(ODEFunc, self).__init__()
+        self.prompt_dim = prompt_dim
+        self.visual_dim = visual_dim
+        
+        # 视觉特征会被存储在这里，供 forward 使用
+        # 这是因为 odeint 只允许 forward(t, x) 签名
+        self.z_v = None  
+        
+        # 主网络: 将 [p(t); z_v] 拼接后映射回 prompt 空间
+        # 输入: prompt_dim + visual_dim
+        # 输出: prompt_dim (导数 dp/dt)
+        self.net = nn.Sequential(
+            nn.Linear(prompt_dim + visual_dim, prompt_dim * 2),
+            nn.LayerNorm(prompt_dim * 2),
+            nn.GELU(),  # 使用 GELU 激活，与 Transformer 一致
+            nn.Linear(prompt_dim * 2, prompt_dim),
+            nn.LayerNorm(prompt_dim),
+            nn.GELU(),
+            nn.Linear(prompt_dim, prompt_dim),
+        )
+        
+        # 零初始化最后一层，确保 ODE 初始时接近恒等映射
+        # 这是 Neural ODE 的常见技巧，有助于训练稳定性
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+    
+    def set_visual_feature(self, z_v):
+        """
+        设置视觉特征条件
+        
+        参数:
+            z_v: 对抗图像嵌入，形状 (batch_size, visual_dim)
+                 我们取 batch 均值作为全局条件
+        """
+        # 取 batch 均值，得到形状 (visual_dim,)
+        self.z_v = z_v.mean(dim=0)  
+
+    def forward(self, t, p):
+        """
+        计算 ODE 导数 dp/dt = f_θ(p, z_v)
+        
+        参数:
+            t: 当前时间点 (标量，ODE 求解器需要，但我们的动力学是时间无关的)
+            p: 当前提示状态，形状 (n_ctx, prompt_dim)
+        
+        返回:
+            dp/dt: 提示状态的变化率，形状 (n_ctx, prompt_dim)
+        """
+        if self.z_v is None:
+            raise RuntimeError("必须先调用 set_visual_feature() 设置视觉特征！")
+        
+        # p 的形状: (n_ctx, prompt_dim)
+        # z_v 的形状: (visual_dim,)
+        
+        # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
+        # 扩展后形状: (n_ctx, visual_dim)
+        z_v_expanded = self.z_v.unsqueeze(0).expand(p.shape[0], -1)
+        
+        # 拼接: [p(t); z_v]
+        # 形状: (n_ctx, prompt_dim + visual_dim)
+        inp = torch.cat([p, z_v_expanded], dim=-1)
+        
+        # 通过网络计算导数
+        # 输出形状: (n_ctx, prompt_dim)
+        dp_dt = self.net(inp)
+        
+        return dp_dt
+
+
 class PromptLearner(nn.Module):
+    """
+    ODE-Prompt 的提示学习器
+    
+    核心改变:
+        - 原始 AdvPT: ctx 是可学习参数，直接用于 prompt
+        - ODE-Prompt: ctx 作为固定初始状态 p(0)，通过 ODE 演化得到 p(T)
+    
+    流程:
+        1. p(0) = "a photo of a" 的文本嵌入 (固定)
+        2. 设置视觉特征 z_v = E_v(x_adv)
+        3. ODE 求解: p(T) = ODEsolve(f_θ, p(0), [0, T])
+        4. 拼接: [SOS, p(T), class_name, EOS]
+    """
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames)
         n_ctx = cfg.TRAINER.ADV.N_CTX
         ctx_init = cfg.TRAINER.ADV.CTX_INIT
         dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
+        ctx_dim = clip_model.ln_final.weight.shape[0]  # prompt 嵌入维度 (e.g., 512 for ViT-B/16)
+        visual_dim = clip_model.visual.output_dim  # 视觉特征维度 (e.g., 512 for ViT-B/16)
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
+        # =========================================================
+        # 初始化 p(0): 固定为 "a photo of a" 的文本嵌入
+        # =========================================================
         if ctx_init:
-            # use given words to initialize context vectors
+            # 使用给定的词语初始化 (e.g., "a photo of a")
             ctx_init = ctx_init.replace("_", " ")
             n_ctx = len(ctx_init.split(" "))
             prompt = clip.tokenize(ctx_init)
             with torch.no_grad():
                 embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
+            # 提取 token 嵌入 (跳过 SOS token)
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]  # 形状: (n_ctx, ctx_dim)
             prompt_prefix = ctx_init
-
         else:
-            # random initialization
-            if cfg.TRAINER.ADV.CSC:
-                print("Initializing class-specific contexts")
-                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
-            else:
-                print("Initializing a generic context")
-                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
+            # 默认使用 "a photo of a"
+            default_init = "a photo of a"
+            n_ctx = len(default_init.split(" "))
+            prompt = clip.tokenize(default_init)
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(prompt).type(dtype)
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
+            prompt_prefix = default_init
 
-        print(f'Initial context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens): {n_ctx}")
+        print(f'[ODE-Prompt] Initial prompt p(0): "{prompt_prefix}"')
+        print(f"[ODE-Prompt] Number of context tokens: {n_ctx}")
+        print(f"[ODE-Prompt] Prompt dimension: {ctx_dim}, Visual dimension: {visual_dim}")
 
-        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+        # =========================================================
+        # p(0) 作为固定的 buffer，不参与梯度更新
+        # 这是与原始 AdvPT 的关键区别！
+        # =========================================================
+        self.register_buffer("p0", ctx_vectors)  # 固定初始状态
+        
+        # =========================================================
+        # ODE 动力学网络 f_θ (这是唯一的可学习部分!)
+        # =========================================================
+        self.ode_func = ODEFunc(ctx_dim, visual_dim).type(dtype)
+        
+        # ODE 求解器参数
+        self.ode_t = torch.tensor([0.0, 1.0])  # 时间范围 [0, T]，T=1
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -136,11 +259,71 @@ class PromptLearner(nn.Module):
         self.class_token_position = cfg.TRAINER.ADV.CLASS_TOKEN_POSITION
 
 
-    def forward(self):
-        ctx = self.ctx
+    def forward(self, z_v):
+        """
+        ODE-Prompt 的前向传播
+        
+        参数:
+            z_v: 对抗图像的视觉特征，形状 (batch_size, visual_dim)
+                 来自 Adversarial Embedding Bank
+        
+        返回:
+            prompts: 完整的提示嵌入，形状 (n_cls, seq_len, dim)
+        
+        流程:
+            1. 设置视觉特征到 ODE 网络
+            2. 求解 ODE: p(T) = ODEsolve(f_θ, p(0), [0,1])
+            3. 拼接 prompt: [SOS, p(T), class_name, EOS]
+        """
+        # =========================================================
+        # Step 1: 设置视觉特征条件
+        # =========================================================
+        # z_v 形状: (batch_size, visual_dim)
+        # ODE 网络会取 batch 均值作为全局条件
+        self.ode_func.set_visual_feature(z_v)
+        
+        # =========================================================
+        # Step 2: ODE 求解 - 核心步骤!
+        # =========================================================
+        # 初始状态: p(0) = "a photo of a" 的嵌入
+        # 形状: (n_ctx, prompt_dim)
+        p0 = self.p0
+        
+        # 时间点: [0, 1]  -> 表示从 t=0 演化到 t=1
+        t = self.ode_t.to(p0.device)
+        
+        # 求解 ODE:
+        # p(T) = p(0) + ∫_0^T f_θ(p(t), z_v) dt
+        # 
+        # odeint 返回形状: (len(t), n_ctx, prompt_dim)
+        # 我们取 [1] 即 t=1 时刻的状态
+        p_trajectory = odeint(
+            self.ode_func,      # 导数函数 dp/dt = f_θ(p, z_v)
+            p0,                 # 初始状态 p(0)
+            t,                  # 时间点 [0, 1]
+            method='rk4',       # Runge-Kutta 4 求解器
+            options={'step_size': 0.5},  # 步长
+            adjoint_method='rk4',        # 伴随方法 (用于反向传播)
+            adjoint_options={'step_size': 0.5}
+        )
+        
+        # 取终端状态 p(T)
+        # 形状: (n_ctx, prompt_dim)
+        ctx = p_trajectory[1]  # t=1 时刻的状态
+        
+        # =========================================================
+        # Step 3: 扩展到所有类别
+        # =========================================================
+        # ctx 形状: (n_ctx, prompt_dim) -> (n_cls, n_ctx, prompt_dim)
+        # 所有类别共享相同的演化后提示
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
 
+        # =========================================================
+        # Step 4: 拼接完整 prompt
+        # =========================================================
+        # prefix: SOS token，形状 (n_cls, 1, dim)
+        # suffix: [class_name, EOS]，形状 (n_cls, *, dim)
         prefix = self.token_prefix
         suffix = self.token_suffix
 
@@ -204,6 +387,17 @@ class PromptLearner(nn.Module):
 
 
 class CustomCLIP(nn.Module):
+    """
+    ODE-Prompt 的自定义 CLIP 模型
+    
+    组件:
+        - prompt_learner: ODE-Prompt 提示学习器
+        - image_encoder: 冻结的 CLIP 图像编码器
+        - text_encoder: 冻结的 CLIP 文本编码器
+    
+    可学习部分:
+        - 仅 prompt_learner.ode_func (即 ODE 动力学网络 f_θ)
+    """
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
@@ -213,33 +407,74 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-
     def forward(self, image):
-        """ original """
+        """
+        正常推理模式 (使用干净图像)
+        
+        流程:
+            1. 编码图像 -> 视觉特征
+            2. ODE 演化提示 (z_v 作为条件)
+            3. 编码提示 -> 文本特征
+            4. 计算相似度
+        """
+        # Step 1: 编码图像
         image_features = self.image_encoder(image.type(self.dtype))
-        prompts = self.prompt_learner()
+        
+        # Step 2: ODE 演化提示
+        # 注意: 这里使用干净图像的特征作为 z_v
+        # 在训练时，会使用 forward_embedding 传入对抗特征
+        prompts = self.prompt_learner(image_features)
+        
+        # Step 3: 编码提示
         tokenized_prompts = self.tokenized_prompts
         text_features = self.text_encoder(prompts, tokenized_prompts)
 
+        # Step 4: 归一化并计算相似度
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         logit_scale = self.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()
 
-
         return logits
 
     def forward_embedding(self, image_features):
-        """ original """
+        """
+        使用预存的对抗嵌入进行训练 (来自 Embedding Bank)
+        
+        这是 ODE-Prompt 训练的核心方法!
+        
+        参数:
+            image_features: 对抗图像嵌入，形状 (batch_size, visual_dim)
+                           来自 Adversarial Embedding Bank
+        
+        返回:
+            logits: 预测分数，形状 (batch_size, n_cls)
+        
+        流程:
+            1. 将对抗嵌入 z_v 传给 ODE 网络
+            2. ODE 演化: p(T) = ODEsolve(f_θ, p(0), [0,1])
+            3. 编码提示 -> 文本特征
+            4. 计算对抗嵌入与文本特征的相似度
+        """
+        # 类型转换
         image_features = image_features.type(self.dtype)
-        prompts = self.prompt_learner()
+        
+        # =========================================================
+        # 核心: 将对抗图像嵌入传给 PromptLearner
+        # 这里 z_v = image_features 来自 Embedding Bank
+        # =========================================================
+        prompts = self.prompt_learner(image_features)  # ODE 演化!
+        
+        # 编码提示
         tokenized_prompts = self.tokenized_prompts
         text_features = self.text_encoder(prompts, tokenized_prompts)
 
+        # 归一化
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
+        # 计算相似度分数
         logit_scale = self.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()
 
@@ -253,6 +488,18 @@ class AdvPT(TrainerX):
         assert cfg.TRAINER.ADV.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
+        """
+        构建 ODE-Prompt 模型
+        
+        核心组件:
+            - CustomCLIP: 包含 PromptLearner (ODE-Prompt)
+            - PromptLearner 中的 ode_func 是唯一可学习的部分
+        
+        冻结部分:
+            - CLIP 图像编码器
+            - CLIP 文本编码器
+            - p(0) 初始状态
+        """
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
@@ -263,13 +510,20 @@ class AdvPT(TrainerX):
             # CLIP's default precision is fp16
             clip_model.float()
 
-        print("Building custom CLIP")
+        print("Building ODE-Prompt CustomCLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
 
-        print("Turning off gradients in both the image and the text encoder")
+        # =========================================================
+        # 只允许 prompt_learner 中的 ODE 网络进行梯度更新
+        # =========================================================
+        print("[ODE-Prompt] Turning off gradients in image/text encoders")
         for name, param in self.model.named_parameters():
             if "prompt_learner" not in name:
                 param.requires_grad_(False)
+        
+        # 统计可学习参数
+        n_params = sum(p.numel() for p in self.model.prompt_learner.parameters() if p.requires_grad)
+        print(f"[ODE-Prompt] Trainable parameters: {n_params:,} (only ODE network f_θ)")
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
@@ -343,6 +597,17 @@ class AdvPT(TrainerX):
         return input, label
 
     def load_model(self, directory, epoch=None):
+        """
+        加载模型权重
+        
+        ODE-Prompt 的可学习部分:
+            - ode_func: ODE 动力学网络 f_θ
+        
+        固定部分 (应该忽略):
+            - p0: 固定初始状态
+            - token_prefix: SOS token
+            - token_suffix: [class_name, EOS]
+        """
         if not directory:
             print("Note that load_model() is skipped as no pretrained model is given")
             return
@@ -365,13 +630,20 @@ class AdvPT(TrainerX):
             state_dict = checkpoint["state_dict"]
             epoch = checkpoint["epoch"]
 
-            # Ignore fixed token vectors
+            # 忽略固定的 token 向量 (这些应该使用当前类别名称计算)
             if "token_prefix" in state_dict:
                 del state_dict["token_prefix"]
-
             if "token_suffix" in state_dict:
                 del state_dict["token_suffix"]
+            
+            # 忽略固定的初始状态 p(0) (这些应该使用当前配置计算)
+            if "p0" in state_dict:
+                del state_dict["p0"]
+            
+            # 兼容旧版本: 如果有 ctx 参数，也忽略
+            if "ctx" in state_dict:
+                del state_dict["ctx"]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
-            # set strict=False
+            # set strict=False 以允许缺失的键
             self._models[name].load_state_dict(state_dict, strict=False)
