@@ -1,37 +1,81 @@
+"""
+ODE-Adversarial-Prompt-Tuning 主训练脚本
+
+本脚本是 ODE-Prompt 框架的入口点，支持以下功能：
+1. 基于 ODE 的对抗提示学习训练
+2. 白盒对抗攻击评估（PGD等）
+3. 黑盒对抗攻击评估（RAP等）
+4. 常规干净样本准确率测试
+
+核心组件：
+- CLIP 模型作为视觉-语言基础模型
+- ODE 动力学网络学习提示演化
+- 对抗训练增强模型鲁棒性
+
+使用示例：
+    # 训练模式
+    python train.py --root /path/to/data --trainer AdvPT --config-file configs/trainers/AdvPT/vit_b16.yaml
+    
+    # 评估模式（白盒攻击）
+    python train.py --eval-only --model-dir /path/to/model --white-attack PGD
+    
+    # 评估模式（黑盒攻击）
+    python train.py --eval-black --model-dir /path/to/model --black-attack RAP
+"""
+
 import argparse
 import torch
 import os
 
+# DASS (Domain Adaptation / Semi-Supervised) 工具库
 from dass.utils import setup_logger, set_random_seed, collect_env_info
 from dass.config import get_cfg_default
 from dass.engine import build_trainer
 
-# custom
-import datasets.oxford_pets
-import datasets.oxford_flowers
-import datasets.fgvc_aircraft
-import datasets.dtd
-import datasets.eurosat
-import datasets.stanford_cars
-import datasets.food101
-import datasets.sun397
-import datasets.caltech101
-import datasets.ucf101
-import datasets.imagenet
+# ============================================================================
+# 数据集导入 - 注册各种下游任务数据集
+# 这些导入会触发数据集类的自动注册到 DASS 框架
+# ============================================================================
 
-import datasets.imagenet_sketch
-import datasets.imagenetv2
-import datasets.imagenet_a
-import datasets.imagenet_r
+# 细粒度分类数据集
+import datasets.oxford_pets       # 宠物分类（37类）
+import datasets.oxford_flowers    # 花卉分类（102类）
+import datasets.fgvc_aircraft     # 飞机型号分类（100类）
+import datasets.dtd               # 纹理分类（47类）
+import datasets.eurosat           # 卫星图像分类（10类）
+import datasets.stanford_cars     # 汽车型号分类（196类）
+import datasets.food101           # 食物分类（101类）
+import datasets.sun397            # 场景分类（397类）
+import datasets.caltech101        # 通用物体分类（101类）
+import datasets.ucf101            # 动作识别（101类）
+import datasets.imagenet          # ImageNet-1K（1000类）
 
-import trainers.advpt
-import trainers.zsclip
+# ImageNet 分布偏移变体 - 用于评估域泛化能力
+import datasets.imagenet_sketch   # ImageNet 素描版本
+import datasets.imagenetv2        # ImageNet 验证集V2
+import datasets.imagenet_a        # ImageNet 对抗样本版本
+import datasets.imagenet_r        # ImageNet 渲染版本
 
+# ============================================================================
+# 训练器导入 - 注册训练算法
+# ============================================================================
+import trainers.advpt             # ODE-Prompt 对抗提示学习训练器
+import trainers.zsclip            # 零样本 CLIP 基线
 
+# 默认精度设置：fp16 用于加速训练，fp32 用于稳定性
 prec = 'fp16'
 
 
 def print_args(args, cfg):
+    """
+    打印命令行参数和配置信息
+    
+    用于调试和实验记录，确保实验可复现性
+    
+    参数：
+        args: 命令行参数对象
+        cfg: YACS 配置节点对象
+    """
     print("***************")
     print("** Arguments **")
     print("***************")
@@ -46,6 +90,24 @@ def print_args(args, cfg):
 
 
 def reset_cfg(cfg, args):
+    """
+    根据命令行参数重置配置
+    
+    命令行参数优先级高于配置文件，此函数实现覆盖逻辑
+    
+    参数：
+        cfg: YACS 配置节点对象（可变）
+        args: 命令行参数对象
+    
+    覆盖的配置项：
+        - DATASET.ROOT: 数据集根目录
+        - OUTPUT_DIR: 输出目录
+        - RESUME: 恢复训练的检查点路径
+        - SEED: 随机种子
+        - TRAINER.NAME: 训练器名称
+        - MODEL.BACKBONE.NAME: 骨干网络名称
+        - MODEL.HEAD.NAME: 分类头名称
+    """
     if args.root:
         cfg.DATASET.ROOT = args.root
 
@@ -70,104 +132,185 @@ def reset_cfg(cfg, args):
 
 def extend_cfg(cfg):
     """
-    Add new config variables.
-
-    E.g.
-        from yacs.config import CfgNode as CN
-        cfg.TRAINER.MY_MODEL = CN()
-        cfg.TRAINER.MY_MODEL.PARAM_A = 1.
-        cfg.TRAINER.MY_MODEL.PARAM_B = 0.5
-        cfg.TRAINER.MY_MODEL.PARAM_C = False
+    扩展默认配置，添加 ODE-Prompt 特有的配置项
+    
+    这些配置项控制 ODE-Prompt 的核心行为：
+    - 提示长度和初始化
+    - 对抗训练的扰动强度
+    - 训练和测试的精度设置
+    
+    配置项说明：
+        N_CTX: 上下文向量数量，即 p(t) 的序列长度
+        CSC: 是否使用类别特定上下文（Class-Specific Context）
+        CTX_INIT: 初始化词语，如 "a photo of a"
+        PREC: 计算精度 (fp16/fp32/amp)
+        CLASS_TOKEN_POSITION: 类别token位置 ('end'/'middle'/'front')
+        TRAIN_EPS: 训练时对抗扰动强度（像素值，/255后使用）
+        TEST_EPS: 测试时对抗扰动强度
+    
+    示例：
+        >>> from yacs.config import CfgNode as CN
+        >>> cfg.TRAINER.MY_MODEL = CN()
+        >>> cfg.TRAINER.MY_MODEL.PARAM_A = 1.
     """
     from yacs.config import CfgNode as CN
 
+    # ODE-Prompt 对抗训练配置
     cfg.TRAINER.ADV = CN()
-    cfg.TRAINER.ADV.N_CTX = 32  # number of context vectors
-    cfg.TRAINER.ADV.CSC = False  # class-specific context
-    cfg.TRAINER.ADV.CTX_INIT = ""  # initialization words
-    cfg.TRAINER.ADV.PREC = prec  # fp16, fp32, amp
-    cfg.TRAINER.ADV.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
+    cfg.TRAINER.ADV.N_CTX = 32                    # 提示token数量（ODE状态维度）
+    cfg.TRAINER.ADV.CSC = False                   # 是否使用类别特定上下文
+    cfg.TRAINER.ADV.CTX_INIT = ""                 # 初始化词语（空则使用默认"a photo of a"）
+    cfg.TRAINER.ADV.PREC = prec                   # 计算精度
+    cfg.TRAINER.ADV.CLASS_TOKEN_POSITION = "end"  # 类别token位置
 
-    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
-    cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256
-    cfg.DATASET.TRAIN_EPS = 8
-    cfg.DATASET.TEST_EPS = 16
-    # cfg.DATASET.NUM_SHOTS = 16
+    # 数据集和数据加载配置
+    cfg.DATASET.SUBSAMPLE_CLASSES = "all"         # 子采样策略：all/base/new
+    cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256  # 嵌入bank的batch大小
+    cfg.DATASET.TRAIN_EPS = 8                     # 训练扰动强度（8/255 ≈ 0.031）
+    cfg.DATASET.TEST_EPS = 16                     # 测试扰动强度（16/255 ≈ 0.063）
 
 
 
 def setup_cfg(args):
+    """
+    设置完整配置
+    
+    配置加载优先级（从低到高）：
+    1. 默认配置
+    2. 数据集配置文件
+    3. 方法配置文件
+    4. 命令行参数
+    5. 额外opts参数
+    
+    参数：
+        args: 命令行参数对象
+    
+    返回：
+        cfg: 冻结的配置对象（不可修改）
+    """
     cfg = get_cfg_default()
     extend_cfg(cfg)
 
-    # 1. From the dataset config file
+    # 1. 从数据集配置文件加载
     if args.dataset_config_file:
         cfg.merge_from_file(args.dataset_config_file)
 
-    # 2. From the method config file
+    # 2. 从方法配置文件加载
     if args.config_file:
         cfg.merge_from_file(args.config_file)
 
-    # 3. From input arguments
+    # 3. 从命令行参数覆盖
     reset_cfg(cfg, args)
 
-    # 4. From optional input arguments
+    # 4. 从额外opts参数覆盖（如 TRAINER.ADV.N_CTX 64）
     cfg.merge_from_list(args.opts)
 
+    # 冻结配置，防止运行时修改
     cfg.freeze()
 
     return cfg
 
 
 def main(args):
+    """
+    主函数 - 协调训练和评估流程
+    
+    流程：
+    1. 设置配置和随机种子
+    2. 构建训练器
+    3. 根据模式执行：
+       - 白盒评估：加载模型 -> 干净测试 -> 对抗测试
+       - 黑盒评估：加载模型 -> 干净测试 -> 黑盒对抗测试
+       - 训练：训练模型 -> 干净测试 -> 对抗测试
+    
+    参数：
+        args: 命令行参数对象
+    """
     cfg = setup_cfg(args)
+    
+    # 设置随机种子以保证可复现性
     if cfg.SEED >= 0:
         print("Setting fixed seed: {}".format(cfg.SEED))
         set_random_seed(cfg.SEED)
+    
+    # 设置日志记录器
     setup_logger(cfg.OUTPUT_DIR)
 
+    # 启用 cuDNN benchmark 加速卷积运算
     if torch.cuda.is_available() and cfg.USE_CUDA:
         torch.backends.cudnn.benchmark = True
 
+
+    # 创建 pkl 数据保存目录（用于存储对抗样本嵌入）
+    # pkl 是 Python 的 pickle 序列化格式，用于将对象持久化到磁盘
+    # 这里主要存储：
+    # 1. 对抗样本的图像嵌入（image embeddings）
+    # 2. 文本嵌入（text embeddings）
+    # 3. 对抗扰动的中间结果
+    # 好处：避免重复计算嵌入，加速对抗攻击评估
     if not os.path.exists(args.path):
         os.makedirs(args.path)
+    
+    # 调试信息（已注释）
     # print_args(args, cfg)
     # print("Collecting env info ...")
     # print("** System info **\n{}\n".format(collect_env_info()))
 
+    # 构建训练器（根据 cfg.TRAINER.NAME 自动选择）
     trainer = build_trainer(cfg)
 
+    # ========================================================================
+    # 白盒攻击评估模式
+    # ========================================================================
     if args.eval_only:
+        # 加载预训练模型
         trainer.load_model(args.model_dir, epoch=args.load_epoch)
         print(args.model_dir)
         print('---------------------------------------------------')
+        
+        # 1. 干净样本准确率测试
         print('clean acc:')
         trainer.test()
         print('---------------------------------------------------')
+        
+        # 2. 白盒对抗攻击测试（如 PGD）
         print('robust acc:')
         trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
         return
 
+    # ========================================================================
+    # 黑盒攻击评估模式
+    # ========================================================================
     elif args.eval_black:
+        # 加载预训练模型
         trainer.load_model(args.model_dir, epoch=args.load_epoch)
         print(args.model_dir)
         print('---------------------------------------------------')
+        
+        # 1. 干净样本准确率测试
         print('clean acc:')
         trainer.test()
         print('---------------------------------------------------')
+        
+        # 2. 黑盒对抗攻击测试（如 RAP、SIA）
         print('robust acc:')
         trainer.before_black_test(args.path, args.black_attack)
         trainer.test_adv()
         return
 
+    # ========================================================================
+    # 训练模式
+    # ========================================================================
     if not args.no_train:
         if args.adv_training:
+            # 对抗训练模式：使用对抗样本进行训练
             trainer.train(adv_training=True)
-
         else:
+            # 标准训练模式
             trainer.train()
-        # trainer.train()
+        
+        # 训练完成后进行评估
         print('---------------------------------------------------')
         print('clean acc:')
         trainer.test()
@@ -180,55 +323,39 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="", help="path to dataset")
-    parser.add_argument("--adv-training", action="store_true")
-    parser.add_argument("--output-dir", type=str, default="", help="output directory")
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default="",
-        help="checkpoint directory (from which the training resumes)",
-    )
-    parser.add_argument(
-        "--config-file", type=str, default="", help="path to config file"
-    )
-    parser.add_argument(
-        "--dataset-config-file",
-        type=str,
-        default="",
-        help="path to config file for dataset setup",
-    )
-    parser.add_argument("--trainer", type=str, default="", help="name of trainer")
+    parser.add_argument("--root", type=str, default="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
+    parser.add_argument("--output-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv", help="output directory")
+    parser.add_argument("--path", type=str, default="./pkl_data/", help="directory of pkl")
+    
+    # 训练控制
+    parser.add_argument("--adv-training", action="store_true", default=True, help="启用对抗训练（使用对抗样本增强训练）")
+    parser.add_argument("--no-train", action="store_true", help="do not call trainer.train()")
+    parser.add_argument("--resume", type=str, default="",help="checkpoint directory (from which the training resumes)")
+    
+    # 配置文件
+    parser.add_argument("--config-file", type=str, default="configs/trainers/AdvPT/vit_b16.yaml", help="path to config file")
+    parser.add_argument("--dataset-config-file", type=str, default="configs/datasets/oxford_pets.yaml",help="path to config file for dataset setup")
+    
+    # 模型设置
+    parser.add_argument("--trainer", type=str, default="AdvPT", help="name of trainer")
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
     parser.add_argument("--head", type=str, default="", help="name of head")
-    parser.add_argument("--eval-only", action="store_true", help="evaluation only")
+    
+    # 评估模式
+    parser.add_argument("--eval-only", action="store_true", help="evaluation only (白盒攻击)")
     parser.add_argument("--eval-black", action="store_true", help="evaluation black-box attack")
-    parser.add_argument("--black-attack", type=str, default="RAP")
-    parser.add_argument("--white-attack", type=str, default="PGD")
-    parser.add_argument("--path", type=str, default="./pkl_data/", help="directory of pkl")
-    parser.add_argument(
-        "--model-dir",
-        type=str,
-        default="",
-        help="load model from this directory for eval-only mode",
-    )
-    parser.add_argument(
-        "--load-epoch", type=int, help="load model weights at this epoch for evaluation"
-    )
-    parser.add_argument(
-        "--no-train", action="store_true", help="do not call trainer.train()"
-    )
-    parser.add_argument(
-        "opts",
-        default=None,
-        nargs=argparse.REMAINDER,
-        help="modify config options using the command-line",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=1, help="only positive value enables a fixed seed"
-    )
+    parser.add_argument("--model-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv",help="load model from this directory for eval-only mode")
+    parser.add_argument("--load-epoch", type=int, help="load model weights at this epoch for evaluation")
+    
+    # 攻击方法选择
+    parser.add_argument("--black-attack", type=str, default="RAP",help="黑盒攻击方法: RAP, SIA 等")
+    parser.add_argument("--white-attack", type=str, default="PGD",help="白盒攻击方法: PGD, FGSM 等")
+    
+    # 额外配置
+    parser.add_argument("opts", default=None, nargs=argparse.REMAINDER,help="modify config options using the command-line")
+    parser.add_argument("--seed", type=int, default=1, help="only positive value enables a fixed seed")
+    
     args = parser.parse_args()
 
-    # threading.Thread(target=log_gpu_usage).start()
-
+    # 启动主程序
     main(args)

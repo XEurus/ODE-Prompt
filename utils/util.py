@@ -1,24 +1,88 @@
+"""
+工具函数模块
+
+本模块提供了模型加载、图像预处理和数学工具函数。
+支持多种预训练模型和归一化方案。
+
+主要功能：
+    - 模型加载：支持 ResNet, ViT, CLIP, ALBEF, MAE 等
+    - 图像归一化：CLIP, ImageNet, 通用归一化方案
+    - 对抗样本工具：L2/Linf 范数约束
+
+支持的模型：
+    - 标准模型: ResNet18/50/101, ViT-B16, EfficientNet, MobileNet, DenseNet
+    - CLIP 模型: RN50, ViT-B/16, ViT-B/32
+    - 自监督模型: MAE, MoCo, SimCLR
+    - 多模态模型: ALBEF, BEiT
+
+归一化参数：
+    - clip: 使用 CLIP 预训练时的归一化参数
+    - imagenet: 使用 ImageNet 预训练时的归一化参数
+    - general: 通用 [0.5, 0.5, 0.5] 归一化
+"""
+
 import torch
 from .enumType import NormType
 from torchvision import transforms
 import timm
-# from models import *
 import ruamel.yaml as yaml
 from pathlib import Path
 from torchvision.models import ResNet101_Weights, ResNet50_Weights, ViT_B_16_Weights, MobileNet_V2_Weights, EfficientNet_B0_Weights, DenseNet121_Weights
 from torchvision._internally_replaced_utils import load_state_dict_from_url
 
 
-normalize_list = {'clip': transforms.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
-                  'general': transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-                  'imagenet': transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])}
+# 不同预训练模型的归一化参数
+normalize_list = {
+    'clip': transforms.Normalize(
+        [0.48145466, 0.4578275, 0.40821073],   # CLIP 训练数据均值
+        [0.26862954, 0.26130258, 0.27577711]   # CLIP 训练数据标准差
+    ),
+    'general': transforms.Normalize(
+        [0.5, 0.5, 0.5],                       # 通用归一化
+        [0.5, 0.5, 0.5]
+    ),
+    'imagenet': transforms.Normalize(
+        [0.485, 0.456, 0.406],                 # ImageNet 数据均值
+        [0.229, 0.224, 0.225]                  # ImageNet 数据标准差
+    )
+}
+
 
 def clamp_by_l2(x, max_norm):
+    """
+    将张量的 L2 范数限制在 max_norm 以内
+    
+    参数：
+        x: 输入张量，形状 (batch, channels, height, width)
+        max_norm: 最大 L2 范数
+    
+    返回：
+        缩放后的张量，保证 ||x||_2 <= max_norm
+    
+    公式：
+        x' = x * min(1, max_norm / ||x||_2)
+    """
     norm = torch.norm(x, dim=(1,2,3), p=2, keepdim=True)
     factor = torch.min(max_norm / norm, torch.ones_like(norm))
     return x * factor
 
+
 def random_init(x, norm_type, epsilon):
+    """
+    对抗扰动的随机初始化
+    
+    参数：
+        x: 原始图像张量
+        norm_type: 范数类型 (NormType.Linf 或 NormType.L2)
+        epsilon: 扰动预算
+    
+    返回：
+        delta: 初始扰动张量
+    
+    初始化策略：
+        - Linf: 均匀分布 [0, epsilon]
+        - L2: 均匀分布后约束到 L2 球内
+    """
     delta = torch.zeros_like(x)
     if norm_type == NormType.Linf:
         delta.data.uniform_(0.0, 1.0)
@@ -31,6 +95,15 @@ def random_init(x, norm_type, epsilon):
 
 
 def is_image_file(filename):
+    """
+    检查文件是否为图像文件
+    
+    参数：
+        filename: 文件名
+    
+    返回：
+        bool: 是否为支持的图像格式
+    """
     IMG_EXTENSIONS = [
         '.jpg', '.JPG', '.jpeg', '.JPEG',
         '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP', '.tiff'
@@ -39,8 +112,39 @@ def is_image_file(filename):
 
 
 def get_model(name, num_classes=2, model_config='config/surrogate.yaml'):
-    """ num_classes is useless, which is just for deploying hook function """
+    """
+    获取预训练模型
+    
+    参数：
+        name: 模型名称
+        num_classes: 分类头输出类别数（用于微调）
+        model_config: 模型配置文件路径
+    
+    返回：
+        model: 加载了预训练权重的模型
+    
+    支持的模型：
+        标准视觉模型：
+            - resnet18, resnet50, resnet101
+            - efficientnet_b0, mobilenet_v2, densenet121
+            - ViT-B16
+        
+        CLIP 模型：
+            - Clip-RN50, Clip-ViT-B16, Clip-ViT-B32
+            - Clip-RN50-arcface (微调版)
+        
+        其他预训练模型：
+            - BeiT_v2-B16, MAE-ViT-B16
+            - ALBEF-ViT-B16
+            - SimCLR-RN50, MoCo-ViT-B16
+    
+    使用示例：
+        >>> model = get_model('resnet50', num_classes=1000)
+        >>> model = get_model('Clip-ViT-B16', num_classes=100)
+    """
     model_config = read_yaml(model_config)
+    
+    # 根据名称创建模型
     if name == 'resnet18':
         model = resnet18(num_classes=num_classes)
     elif name == 'resnet101':
@@ -106,8 +210,7 @@ def get_model(name, num_classes=2, model_config='config/surrogate.yaml'):
     else:
         raise (f'Model {name} Not Found')
 
-    # load weights
-
+    # 加载预训练权重
     if name == 'resnet101':
         state_dict = load_state_dict_from_url(ResNet101_Weights.IMAGENET1K_V1.url, model_dir='cache')
         del state_dict['fc.weight'], state_dict['fc.bias']
@@ -166,19 +269,50 @@ def get_model(name, num_classes=2, model_config='config/surrogate.yaml'):
         for k in new_state_dict.keys():
             new_state_dict[k] = state_dict['module.base_encoder.'+ k]
         model.load_state_dict(new_state_dict, strict=False)
-    # else:
-    #     raise (f'Model {name} Not Found')
 
     return model
 
 
 def read_yaml(path):
+    """
+    读取 YAML 配置文件
+    
+    参数：
+        path: YAML 文件路径
+    
+    返回：
+        解析后的配置字典
+    """
     return yaml.load(open(path, 'r'), Loader=yaml.Loader)
 
+
 def dir_check(path):
+    """
+    检查并创建目录
+    
+    如果目录不存在则创建，包括所有父目录。
+    
+    参数：
+        path: 目录路径
+    """
     Path(path).mkdir(parents=True, exist_ok=True)
 
+
 def distance(A, B):
+    """
+    计算两组向量之间的欧几里得距离矩阵
+    
+    参数：
+        A: 第一组向量，形状 (m, d)
+        B: 第二组向量，形状 (n, d)
+    
+    返回：
+        距离矩阵，形状 (m, n)
+        dist[i,j] = ||A[i] - B[j]||^2
+    
+    公式：
+        ||a - b||^2 = ||a||^2 + ||b||^2 - 2 * a·b
+    """
     prod = A @ B.T
 
     prod_A = A @ A.T
@@ -190,25 +324,45 @@ def distance(A, B):
     res = norm_A + norm_B - 2 * prod
     return res
 
+
 def interpolate_pos_embed(pos_embed_checkpoint, visual_encoder):
-    # interpolate position embedding
+    """
+    插值位置嵌入
+    
+    当预训练模型和目标模型的图像尺寸不同时，需要对位置嵌入进行插值。
+    
+    参数：
+        pos_embed_checkpoint: 检查点中的位置嵌入
+        visual_encoder: 目标视觉编码器
+    
+    返回：
+        插值后的位置嵌入
+    
+    处理逻辑：
+        1. 保留 class token 和 dist token 不变
+        2. 对位置 token 进行双三次插值
+        3. 拼接返回
+    """
     embedding_size = pos_embed_checkpoint.shape[-1]
     num_patches = visual_encoder.patch_embed.num_patches
     num_extra_tokens = visual_encoder.pos_embed.shape[-2] - num_patches
-    # height (== width) for the checkpoint position embedding
+    
+    # 原始和目标尺寸
     orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-    # height (== width) for the new position embedding
     new_size = int(num_patches ** 0.5)
 
     if orig_size != new_size:
-        # class_token and dist_token are kept unchanged
+        # 分离 class token 和位置 token
         extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-        # only the position tokens are interpolated
         pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+        
+        # 重塑并插值
         pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
         pos_tokens = torch.nn.functional.interpolate(
             pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
         pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+        
+        # 拼接
         new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
         print('reshape position embedding from %d to %d' % (orig_size ** 2, new_size ** 2))
 

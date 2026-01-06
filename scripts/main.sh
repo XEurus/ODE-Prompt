@@ -1,6 +1,6 @@
 
 # custom config
-ROOT="/home/dji/Project/ODE-Prompt/Adversarial-Prompt-Tuning/Data"
+ROOT="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data"
 TRAINER=AdvPT
 # oxford_flowers, oxford_pets, imagenet, food101, sun397, dtd, eurosat, ucf101
 DATASET=oxford_pets
@@ -15,7 +15,7 @@ D=$ROOT
 SEED=1
 
 DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv
-PYTHON="/home/dji/Project/ODE-Prompt/dassl/bin/python"
+PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
 echo "--------------------------------------------------------------------------------------"
 $PYTHON train.py \
 --root ${D} \
@@ -36,7 +36,7 @@ TRAINER.ADV.CSC ${CSC}
 # echo "--------------------------------------------------------------------------------------"
 # echo "zero shot"
 # TRAINER=ZeroshotCLIP
-# python train.py \
+# $PYTHON train.py \
 # --root ${D} \
 # --trainer ${TRAINER} \
 # --dataset-config-file configs/datasets/${DATASET}.yaml \

@@ -110,23 +110,50 @@ class ODEFunc(nn.Module):
         # 这是因为 odeint 只允许 forward(t, x) 签名
         self.z_v = None  
         
-        # 主网络: 将 [p(t); z_v] 拼接后映射回 prompt 空间
-        # 输入: prompt_dim + visual_dim
-        # 输出: prompt_dim (导数 dp/dt)
-        self.net = nn.Sequential(
-            nn.Linear(prompt_dim + visual_dim, prompt_dim * 2),
-            nn.LayerNorm(prompt_dim * 2),
-            nn.GELU(),  # 使用 GELU 激活，与 Transformer 一致
-            nn.Linear(prompt_dim * 2, prompt_dim),
-            nn.LayerNorm(prompt_dim),
-            nn.GELU(),
-            nn.Linear(prompt_dim, prompt_dim),
-        )
+        # 主网络: 使用 Residual MLP 替代简单的 MLP
+        # 增加网络容量，有助于学习更复杂的动力学
+        self.hidden_dim = prompt_dim * 2
+        
+        self.input_proj = nn.Linear(prompt_dim + visual_dim, self.hidden_dim)
+        self.norm_in = nn.LayerNorm(self.hidden_dim)
+        self.act = nn.GELU()
+        
+        # 残差块 1
+        self.res1_fc1 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.res1_norm1 = nn.LayerNorm(self.hidden_dim)
+        self.res1_act = nn.GELU()
+        self.res1_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.res1_norm2 = nn.LayerNorm(self.hidden_dim)
+
+        # 残差块 2
+        self.res2_fc1 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.res2_norm1 = nn.LayerNorm(self.hidden_dim)
+        self.res2_act = nn.GELU()
+        self.res2_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.res2_norm2 = nn.LayerNorm(self.hidden_dim)
+
+        # 动态创建 ResNet-50 级别的深度
+        # ResNet-50 有 16 个 bottleneck blocks (3 layers each) + input/output
+        # 这里我们使用 BasicBlock (2 layers each)，大约需要 24 个块来达到类似的深度 (50层左右)
+        # 1 (input) + 24*2 (residual) + 1 (output) = 50 layers
+        
+        self.res_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim)
+            ) for _ in range(8)  # 24 个残差块
+        ])
+        
+        # 输出投影
+        self.output_proj = nn.Linear(self.hidden_dim, prompt_dim)
         
         # 零初始化最后一层，确保 ODE 初始时接近恒等映射
         # 这是 Neural ODE 的常见技巧，有助于训练稳定性
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
     
     def set_visual_feature(self, z_v):
         """
@@ -164,9 +191,50 @@ class ODEFunc(nn.Module):
         # 形状: (n_ctx, prompt_dim + visual_dim)
         inp = torch.cat([p, z_v_expanded], dim=-1)
         
-        # 通过网络计算导数
-        # 输出形状: (n_ctx, prompt_dim)
-        dp_dt = self.net(inp)
+        # Residual MLP 前向传播
+        x = self.input_proj(inp)
+        x = self.norm_in(x)
+        x = self.act(x)
+        
+        # 残差块 1
+        identity = x
+        out = self.res1_fc1(x)
+        out = self.res1_norm1(out)
+        out = self.res1_act(out)
+        out = self.res1_fc2(out)
+        out = self.res1_norm2(out)
+        x = identity + out  # Skip connection
+        x = self.act(x)
+        
+        # 残差块 2
+        identity = x
+        out = self.res2_fc1(x)
+        out = self.res2_norm1(out)
+        out = self.res2_act(out)
+        out = self.res2_fc2(out)
+        out = self.res2_norm2(out)
+        
+        # 增加缩放因子 (Scale Factor)
+        # 对于深层 ResNet，缩放残差分支有助于稳定信号传播
+        # 这在 Neural ODE 中尤为重要，可以降低刚性 (Stiffness)
+        out = out * 0.2  
+        
+        x = identity + out  # Skip connection
+        x = self.act(x)
+
+        # 循环经过所有额外的残差块
+        for block in self.res_blocks:
+            identity = x
+            out = block(x)
+            
+            # 同样对深层块应用缩放
+            out = out * 0.2
+            
+            x = identity + out
+            x = self.act(x)
+        
+        # 输出层
+        dp_dt = self.output_proj(x)
         
         return dp_dt
 
@@ -301,10 +369,13 @@ class PromptLearner(nn.Module):
             self.ode_func,      # 导数函数 dp/dt = f_θ(p, z_v)
             p0,                 # 初始状态 p(0)
             t,                  # 时间点 [0, 1]
-            method='rk4',       # Runge-Kutta 4 求解器
-            options={'step_size': 0.5},  # 步长
-            adjoint_method='rk4',        # 伴随方法 (用于反向传播)
-            adjoint_options={'step_size': 0.5}
+            method='dopri5',    # Dormand-Prince 5 (自适应步长)
+            rtol=1e-3,          # 放宽误差容限以避免 underflow
+            atol=1e-3,          
+            adjoint_method='dopri5',        
+            adjoint_rtol=1e-3,
+            adjoint_atol=1e-3,
+            options={'safety': 0.1, 'min_step': 1e-3} # 强制设置最小步长，防止 underflow
         )
         
         # 取终端状态 p(T)
