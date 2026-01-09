@@ -307,7 +307,7 @@ class TrainerBase:
         """
         self.start_epoch = start_epoch
         self.max_epoch = max_epoch
-
+        print("adv_training: ", adv_training)
         # self.before_train() # 注意：before_train通常在调用此方法前手动调用或在子类中处理
         if adv_training:
             # 如果是对抗训练，进行预处理（例如生成对抗样本）
@@ -495,11 +495,11 @@ class SimpleTrainer(TrainerBase):
             print(f"Detected {device_count} GPUs (use nn.DataParallel)")
             self.model = nn.DataParallel(self.model)
 
-    def train(self, adv_training=False):
+    def train(self,path=None, adv_training=False):
         """
         调用父类的train方法开始训练。
         """
-        super().train(self.start_epoch, self.max_epoch, adv_training)
+        super().train(self.start_epoch, self.max_epoch, path=path, adv_training=adv_training)
 
     def before_train(self):
         """

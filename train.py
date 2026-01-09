@@ -305,7 +305,7 @@ def main(args):
     if not args.no_train:
         if args.adv_training:
             # 对抗训练模式：使用对抗样本进行训练
-            trainer.train(adv_training=True)
+            trainer.train(path=args.path, adv_training=True)
         else:
             # 标准训练模式
             trainer.train()

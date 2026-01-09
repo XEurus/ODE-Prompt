@@ -132,10 +132,7 @@ class ODEFunc(nn.Module):
         self.res2_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.res2_norm2 = nn.LayerNorm(self.hidden_dim)
 
-        # 动态创建 ResNet-50 级别的深度
-        # ResNet-50 有 16 个 bottleneck blocks (3 layers each) + input/output
-        # 这里我们使用 BasicBlock (2 layers each)，大约需要 24 个块来达到类似的深度 (50层左右)
-        # 1 (input) + 24*2 (residual) + 1 (output) = 50 layers
+        # 可动态创建任意深度的残差块
         
         self.res_blocks = nn.ModuleList([
             nn.Sequential(
@@ -144,7 +141,7 @@ class ODEFunc(nn.Module):
                 nn.GELU(),
                 nn.Linear(self.hidden_dim, self.hidden_dim),
                 nn.LayerNorm(self.hidden_dim)
-            ) for _ in range(8)  # 24 个残差块
+            ) for _ in range(1)  # 1 个残差块
         ])
         
         # 输出投影
@@ -217,7 +214,7 @@ class ODEFunc(nn.Module):
         # 增加缩放因子 (Scale Factor)
         # 对于深层 ResNet，缩放残差分支有助于稳定信号传播
         # 这在 Neural ODE 中尤为重要，可以降低刚性 (Stiffness)
-        out = out * 0.2  
+        #out = out * 0.2  
         
         x = identity + out  # Skip connection
         x = self.act(x)
@@ -228,7 +225,7 @@ class ODEFunc(nn.Module):
             out = block(x)
             
             # 同样对深层块应用缩放
-            out = out * 0.2
+            #out = out * 0.2
             
             x = identity + out
             x = self.act(x)
@@ -279,14 +276,21 @@ class PromptLearner(nn.Module):
             ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]  # 形状: (n_ctx, ctx_dim)
             prompt_prefix = ctx_init
         else:
-            # 默认使用 "a photo of a"
-            default_init = "a photo of a"
-            n_ctx = len(default_init.split(" "))
-            prompt = clip.tokenize(default_init)
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
-            prompt_prefix = default_init
+            # random initialization
+            if cfg.TRAINER.ADV.CSC:
+                print("Initializing class-specific contexts")
+                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+            else:
+                print("Initializing a generic context")
+                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+        # else:
+        #     # 使用随机正态分布初始化 (Random Initialization)
+        #     n_ctx = cfg.TRAINER.ADV.N_CTX
+        #     ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
+        #     nn.init.normal_(ctx_vectors, std=0.02)
+        #     prompt_prefix = "<random_init>"
 
         print(f'[ODE-Prompt] Initial prompt p(0): "{prompt_prefix}"')
         print(f"[ODE-Prompt] Number of context tokens: {n_ctx}")
