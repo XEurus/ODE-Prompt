@@ -323,7 +323,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
+    parser.add_argument("--root", type=str, default="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
     parser.add_argument("--output-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv", help="output directory")
     parser.add_argument("--path", type=str, default="./pkl_data/", help="directory of pkl")
     

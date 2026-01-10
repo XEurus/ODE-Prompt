@@ -1,13 +1,13 @@
 
 # custom config
-ROOT="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data"
+ROOT="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data"
 TRAINER=AdvPT
 # oxford_flowers, oxford_pets, imagenet, food101, sun397, dtd, eurosat, ucf101
 DATASET=oxford_pets
 # rn50, vit_b16, vit_l14
-CFG=vit_b16 # config file
+CFG=vit_l14 # config file
 CTP=end  # class token position (end or middle)
-NCTX=32  # number of context tokens
+NCTX=64  # number of context tokens
 #SHOTS=16  # number of shots (1, 2, 4, 8, 16)
 CSC=False  # class-specific context (False or True)
 
@@ -15,7 +15,7 @@ D=$ROOT
 SEED=1
 
 DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv
-PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
+PYTHON="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
 echo "--------------------------------------------------------------------------------------"
 $PYTHON train.py \
 --root ${D} \
@@ -30,9 +30,6 @@ $PYTHON train.py \
 TRAINER.ADV.N_CTX ${NCTX} \
 TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
 TRAINER.ADV.CSC ${CSC}
-
-
-
 # echo "--------------------------------------------------------------------------------------"
 # echo "zero shot"
 # TRAINER=ZeroshotCLIP
