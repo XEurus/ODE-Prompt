@@ -159,6 +159,17 @@ class TrainerBase:
         """
         names = self.get_model_names()
 
+        # If model_name is not provided, generate a default one based on config prefix
+        if not model_name:
+            prefix = "model"
+            if hasattr(self, "cfg") and hasattr(self.cfg, "MODEL") and hasattr(self.cfg.MODEL, "FILE_PREFIX"):
+                prefix = self.cfg.MODEL.FILE_PREFIX
+            
+            if is_best:
+                model_name = f"{prefix}-best.pth.tar"
+            else:
+                model_name = f"{prefix}.pth.tar-{epoch + 1}"
+
         for name in names:
             model_dict = self._models[name].state_dict()
 
@@ -211,7 +222,7 @@ class TrainerBase:
 
         return start_epoch
 
-    def load_model(self, directory, epoch=None):
+    def load_model(self, directory, epoch=None, model_file=None):
         """
         加载指定模型。
         """
@@ -225,9 +236,10 @@ class TrainerBase:
         names = self.get_model_names()
 
         # 默认加载最佳模型
-        model_file = "model-best.pth.tar"
-        if epoch is not None:
-            model_file = "model.pth.tar-" + str(epoch)
+        if model_file is None:
+            model_file = "model-best.pth.tar"
+            if epoch is not None:
+                model_file = "model.pth.tar-" + str(epoch)
 
         for name in names:
             model_path = osp.join(directory, name, model_file)
@@ -683,7 +695,7 @@ class SimpleTrainer(TrainerBase):
                     self.epoch,
                     self.output_dir,
                     val_result=curr_result,
-                    model_name="model-best.pth.tar"
+                    is_best=True
                 )
 
         # 如果满足检查点保存频率或这是最后一个epoch，则保存模型

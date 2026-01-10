@@ -112,37 +112,26 @@ class ODEFunc(nn.Module):
         
         # 主网络: 使用 Residual MLP 替代简单的 MLP
         # 增加网络容量，有助于学习更复杂的动力学
-        self.hidden_dim = prompt_dim * 2
+        self.hidden_dim = prompt_dim * 8
         
         self.input_proj = nn.Linear(prompt_dim + visual_dim, self.hidden_dim)
-        self.norm_in = nn.LayerNorm(self.hidden_dim)
+        # self.norm_in = nn.LayerNorm(self.hidden_dim)
         self.act = nn.GELU()
-        
-        # 残差块 1
-        self.res1_fc1 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res1_norm1 = nn.LayerNorm(self.hidden_dim)
-        self.res1_act = nn.GELU()
-        self.res1_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res1_norm2 = nn.LayerNorm(self.hidden_dim)
 
-        # 残差块 2
-        self.res2_fc1 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res2_norm1 = nn.LayerNorm(self.hidden_dim)
-        self.res2_act = nn.GELU()
-        self.res2_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res2_norm2 = nn.LayerNorm(self.hidden_dim)
-
-        # 可动态创建任意深度的残差块
+        self.mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
+        )
         
-        self.res_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim)
-            ) for _ in range(8)  # 1 个残差块
-        ])
+        # self.res_blocks = nn.ModuleList([
+        #     nn.Sequential(
+        #         nn.Linear(self.hidden_dim, self.hidden_dim),
+        #         nn.LayerNorm(self.hidden_dim),
+        #         nn.GELU(),
+        #         nn.Linear(self.hidden_dim, self.hidden_dim),
+        #         nn.LayerNorm(self.hidden_dim)
+        #     ) for _ in range(1)  # 1 个残差块
+        # ])
         
         # 输出投影
         self.output_proj = nn.Linear(self.hidden_dim, prompt_dim)
@@ -190,45 +179,8 @@ class ODEFunc(nn.Module):
         
         # Residual MLP 前向传播
         x = self.input_proj(inp)
-        x = self.norm_in(x)
-        x = self.act(x)
-        
-        # # 残差块 1
-        # identity = x
-        # out = self.res1_fc1(x)
-        # out = self.res1_norm1(out)
-        # out = self.res1_act(out)
-        # out = self.res1_fc2(out)
-        # out = self.res1_norm2(out)
-        # x = identity + out  # Skip connection
-        # x = self.act(x)
-        
-        # # 残差块 2
-        # identity = x
-        # out = self.res2_fc1(x)
-        # out = self.res2_norm1(out)
-        # out = self.res2_act(out)
-        # out = self.res2_fc2(out)
-        # out = self.res2_norm2(out)
-        
-        # # 增加缩放因子 (Scale Factor)
-        # # 对于深层 ResNet，缩放残差分支有助于稳定信号传播
-        # # 这在 Neural ODE 中尤为重要，可以降低刚性 (Stiffness)
-        # #out = out * 0.2  
-        
-        # x = identity + out  # Skip connection
-        # x = self.act(x)
-
-        # 循环经过所有额外的残差块
-        for block in self.res_blocks:
-            identity = x
-            out = block(x)
-            
-            # 同样对深层块应用缩放
-            out = out * 0.2
-            
-            x = identity + out
-            x = self.act(x)
+        x = self.act(x) 
+        x = self.mlp(x)
         
         # 输出层
         dp_dt = self.output_proj(x)
