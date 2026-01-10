@@ -262,62 +262,67 @@ def main(args):
     # ========================================================================
     # 白盒攻击评估模式
     # ========================================================================
-    if args.eval_only:
+    # if args.eval_only:
         # 加载预训练模型
-        trainer.load_model(args.model_dir, epoch=args.load_epoch)
-        print(args.model_dir)
-        print('---------------------------------------------------')
-        
-        # 1. 干净样本准确率测试
-        print('clean acc:')
-        trainer.test()
-        print('---------------------------------------------------')
-        
-        # 2. 白盒对抗攻击测试（如 PGD）
-        print('robust acc:')
-        trainer.before_adv_test(args.path, args.white_attack)
-        trainer.test_adv()
-        return
+    args.eval_only = True
+    trainer.load_model(args.model_dir, epoch=args.load_epoch, model_file=args.model_file)
+    print(args.model_dir)
+    print('---------------------------------------------------')
+    
+    # # 1. 干净样本准确率测试
+    # print('clean acc:')
+    # trainer.test()
+    # print('---------------------------------------------------')
+    
+    # # 2. 白盒对抗攻击测试（如 PGD）
+    # print('robust acc:')
+    # trainer.before_adv_test(args.path, args.white_attack)
+    # trainer.test_adv()
+    print('---------------------------------------------------')
+    print('adaptive attack acc:')
+    trainer.test_adaptive_attack()
+    print('---------------------------------------------------')
+    return
 
     # ========================================================================
     # 黑盒攻击评估模式
     # ========================================================================
-    elif args.eval_black:
-        # 加载预训练模型
-        trainer.load_model(args.model_dir, epoch=args.load_epoch)
-        print(args.model_dir)
-        print('---------------------------------------------------')
+    # elif args.eval_black:
+    #     # 加载预训练模型
+    #     trainer.load_model(args.model_dir, epoch=args.load_epoch)
+    #     print(args.model_dir)
+    #     print('---------------------------------------------------')
         
-        # 1. 干净样本准确率测试
-        print('clean acc:')
-        trainer.test()
-        print('---------------------------------------------------')
+    #     # 1. 干净样本准确率测试
+    #     print('clean acc:')
+    #     trainer.test()
+    #     print('---------------------------------------------------')
         
-        # 2. 黑盒对抗攻击测试（如 RAP、SIA）
-        print('robust acc:')
-        trainer.before_black_test(args.path, args.black_attack)
-        trainer.test_adv()
-        return
+    #     # 2. 黑盒对抗攻击测试（如 RAP、SIA）
+    #     print('robust acc:')
+    #     trainer.before_black_test(args.path, args.black_attack)
+    #     trainer.test_adv()
+    #     return
 
-    # ========================================================================
-    # 训练模式
-    # ========================================================================
-    if not args.no_train:
-        if args.adv_training:
-            # 对抗训练模式：使用对抗样本进行训练
-            trainer.train(path=args.path, adv_training=True)
-        else:
-            # 标准训练模式
-            trainer.train()
+    # # ========================================================================
+    # # 训练模式
+    # # ========================================================================
+    # if not args.no_train:
+    #     if args.adv_training:
+    #         # 对抗训练模式：使用对抗样本进行训练
+    #         trainer.train(path=args.path, adv_training=True)
+    #     else:
+    #         # 标准训练模式
+    #         trainer.train()
         
-        # 训练完成后进行评估
-        print('---------------------------------------------------')
-        print('clean acc:')
-        trainer.test()
-        print('---------------------------------------------------')
-        print('robust acc:')
-        trainer.before_adv_test(args.path, args.white_attack)
-        trainer.test_adv()
+    #     # 训练完成后进行评估
+    #     print('---------------------------------------------------')
+    #     print('clean acc:')
+    #     trainer.test()
+    #     print('---------------------------------------------------')
+    #     print('robust acc:')
+    #     trainer.before_adv_test(args.path, args.white_attack)
+    #     trainer.test_adv()
 
 
 
@@ -340,7 +345,7 @@ if __name__ == "__main__":
     parser.add_argument("--trainer", type=str, default="AdvPT", help="name of trainer")
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
     parser.add_argument("--head", type=str, default="", help="name of head")
-    
+    parser.add_argument("--model-file", type=str, default="8_layer_resnet_model.pth.tar-100", help="name of model file")
     # 评估模式
     parser.add_argument("--eval-only", action="store_true", help="evaluation only (白盒攻击)")
     parser.add_argument("--eval-black", action="store_true", help="evaluation black-box attack")

@@ -5,6 +5,7 @@ import datetime
 from collections import OrderedDict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
@@ -225,7 +226,6 @@ class TrainerBase:
 
         # 默认加载最佳模型
         model_file = "model-best.pth.tar"
-
         if epoch is not None:
             model_file = "model.pth.tar-" + str(epoch)
 
@@ -528,7 +528,7 @@ class SimpleTrainer(TrainerBase):
                                                                          "_"))
         # 如果文件存在，直接加载
         if os.path.isfile(pkl_path):
-            self.train_pkl = torch.load(pkl_path).to('cpu')
+            self.train_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
             print('loaded train_pkl')
             return
         
@@ -590,7 +590,7 @@ class SimpleTrainer(TrainerBase):
         
         # 如果存在，直接加载
         if os.path.isfile(pkl_path):
-            self.test_pkl = torch.load(pkl_path)
+            self.test_pkl = torch.load(pkl_path, weights_only=False)
             return
         
         # 初始化存储测试对抗样本的张量
@@ -636,7 +636,7 @@ class SimpleTrainer(TrainerBase):
         normalize = transforms.Normalize(mean_value, std_value)
         self.mean, self.std = mean, std
         if os.path.isfile(pkl_path):
-            self.test_pkl = torch.load(pkl_path)
+            self.test_pkl = torch.load(pkl_path, weights_only=False)
             self.test_pkl = (self.test_pkl - mean) / std
             return
         else:
@@ -745,6 +745,103 @@ class SimpleTrainer(TrainerBase):
             tag = f"{split}/{k}"
             self.write_scalar(tag, v, self.epoch)
 
+        return list(results.values())[0]
+
+    def test_adaptive_attack(self, split=None):
+        """
+        Adaptive Attack Test:
+        Generate PGD attacks using the full model gradient (including ODE part).
+        This tests if the defense holds up when the attacker knows the defense mechanism.
+        """
+        self.set_model_mode("eval") # 必须设为eval，但我们需要梯度回传到输入
+        # 注意：虽然是eval模式，但我们仍然可以通过 set_requires_grad(True) 来求输入的梯度
+        
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"
+            data_loader = self.test_loader
+
+        print(f"Evaluate on the *{split}* set with Adaptive PGD Attack (Gradient through ODE)")
+        
+        # Setup Normalization
+        mean_val = [0.48145466, 0.4578275, 0.40821073]
+        std_val = [0.26862954, 0.26130258, 0.27577711]
+        mean = torch.tensor(mean_val).view(-1, 1, 1).to(self.device)
+        std = torch.tensor(std_val).view(-1, 1, 1).to(self.device)
+        
+        # Parameters
+        test_eps = self.cfg.DATASET.TEST_EPS
+        eps_val = test_eps / 255.0
+        n_iters = 40  # Strong attack
+        alpha = 2.0 / 255.0
+
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            input, label = self.parse_batch_test(batch)
+            label = label.to(self.device)
+            
+            # --- Adaptive PGD Attack Start ---
+            
+            # Start from clean images (already normalized in loader)
+            images = input.clone().detach()
+            
+            # Initialize perturbation in normalized space
+            # 为了计算方便，我们在归一化空间进行梯度更新，但在截断时还原到像素空间
+            delta = torch.zeros_like(images).uniform_(-0.01, 0.01) # Small random init
+            delta.requires_grad = True
+            
+            for _ in range(n_iters):
+                # Forward pass through FULL model (including ODE)
+                adv_input = images + delta
+                
+                # 重要：清空模型梯度
+                self.model.zero_grad()
+                
+                output = self.model(adv_input)
+                loss = F.cross_entropy(output, label)
+                
+                # Calculate gradient of loss w.r.t delta
+                grad = torch.autograd.grad(loss, delta, retain_graph=False)[0]
+                
+                # PGD Update: Maximize Loss
+                delta.data = delta.data + alpha * grad.sign()
+                
+                # Projection / Clamping
+                # 1. Denormalize to pixel space
+                x_adv = (images + delta) * std + mean
+                x_clean = images * std + mean
+                
+                # 2. Clamp perturbation magnitude (L_inf)
+                diff = x_adv - x_clean
+                diff = torch.clamp(diff, -eps_val, eps_val)
+                x_adv = x_clean + diff
+                
+                # 3. Clamp to valid image range [0, 1]
+                x_adv = torch.clamp(x_adv, 0.0, 1.0)
+                
+                # 4. Normalize back
+                delta.data = ((x_adv - mean) / std) - images
+
+            # Final adversarial images
+            input_adv = images + delta.detach()
+            
+            # --- Adaptive PGD Attack End ---
+
+            # Inference on adaptive adversarial examples
+            output = self.model_inference(input_adv)
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+        for k, v in results.items():
+            tag = f"{split}_adaptive/{k}"
+            self.write_scalar(tag, v, self.epoch)
+
+        print(f"Adaptive Attack Results: {list(results.values())[0]}")
         return list(results.values())[0]
 
     @torch.no_grad()

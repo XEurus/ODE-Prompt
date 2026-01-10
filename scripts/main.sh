@@ -13,33 +13,43 @@ CSC=False  # class-specific context (False or True)
 
 D=$ROOT
 SEED=1
-
-DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv
+TIME=$(date +%Y%m%d%H%M%S)
+DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/${TIME}
 PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
-echo "--------------------------------------------------------------------------------------"
-$PYTHON train.py \
---root ${D} \
---adv-training \
---seed ${SEED} \
---trainer ${TRAINER} \
---dataset-config-file configs/datasets/${DATASET}.yaml \
---config-file configs/trainers/${TRAINER}/${CFG}.yaml \
---output-dir ${DIR} \
---model-dir ${DIR} \
---adv-training \
-TRAINER.ADV.N_CTX ${NCTX} \
-TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
-TRAINER.ADV.CSC ${CSC}
-
-
-
 # echo "--------------------------------------------------------------------------------------"
-# echo "zero shot"
-# TRAINER=ZeroshotCLIP
 # $PYTHON train.py \
 # --root ${D} \
+# --adv-training \
+# --seed ${SEED} \
 # --trainer ${TRAINER} \
 # --dataset-config-file configs/datasets/${DATASET}.yaml \
-# --config-file configs/trainers/AdvPT/${CFG}.yaml \
-# --output-dir output/${TRAINER}/${CFG}/${DATASET} \
+# --config-file configs/trainers/${TRAINER}/${CFG}.yaml \
+# --output-dir ${DIR} \
+# --model-dir ${DIR} \
+# --adv-training \
+# TRAINER.ADV.N_CTX ${NCTX} \
+# TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
+# TRAINER.ADV.CSC ${CSC}
+
+
+
+echo "--------------------------------------------------------------------------------------"
+echo "zero shot"
+TRAINER=ZeroshotCLIP
+$PYTHON train.py \
+--root ${D} \
+--trainer ${TRAINER} \
+--dataset-config-file configs/datasets/${DATASET}.yaml \
+--config-file configs/trainers/AdvPT/${CFG}.yaml \
+--output-dir output/${TRAINER}/${CFG}/${DATASET} \
+--model-dir /home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16/adv/prompt_learner/8_layer_resnet_model.pth.tar-100 \
+--eval-only
+
+# python train.py 
+# --root ${D} 
+# --trainer ZeroshotCLIP 
+# --dataset-config-file configs/datasets/${DATASET}.yaml 
+# --config-file configs/trainers/AdvPT/${CFG}.yaml 
+# --output-dir ${DIR} 
+# --model-dir ${DIR} 
 # --eval-only
