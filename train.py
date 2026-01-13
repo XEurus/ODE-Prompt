@@ -304,14 +304,14 @@ def main(args):
     # ========================================================================
     elif args.eval_black:
         # 加载预训练模型
-        trainer.load_model(args.model_dir, epoch=args.load_epoch)
+        trainer.load_model(args.model_dir, epoch=args.load_epoch, model_file=args.model_file)
         print(args.model_dir)
         print('---------------------------------------------------')
         
-        # 1. 干净样本准确率测试
-        print('clean acc:')
-        trainer.test()
-        print('---------------------------------------------------')
+        # # 1. 干净样本准确率测试
+        # print('clean acc:')
+        # trainer.test()
+        # print('---------------------------------------------------')
         
         # 2. 黑盒对抗攻击测试（如 RAP、SIA）
         print('robust acc:')

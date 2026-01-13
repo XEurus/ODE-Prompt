@@ -652,7 +652,10 @@ class SimpleTrainer(TrainerBase):
             self.test_pkl = (self.test_pkl - mean) / std
             return
         else:
-            raise NameError
+            raise FileNotFoundError(
+                f"Adversarial examples not found at {pkl_path}. "
+                f"Please run 'python black.py' to generate {attack} adversarial examples first."
+            )
 
     def purify(self, baseline='super-resolution'):
         """

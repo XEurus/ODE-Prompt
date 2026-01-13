@@ -42,7 +42,7 @@ import scipy.stats as st
 from torch import randperm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import foolbox
-from SIA import SIA
+# from SIA import SIA
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -91,14 +91,20 @@ def extend_cfg(cfg):
 
 
 def finetune(model, train_loader, num_epochs = 90):
+    model = model.to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.fc.parameters(), lr=0.001)
+    if isinstance(model, nn.Sequential):
+        # Assuming model is wrapped as Sequential(Normalize, Model)
+        params = model[1].fc.parameters()
+    else:
+        params = model.fc.parameters()
+    optimizer = optim.AdamW(params, lr=0.001)
     scheduler = CosineAnnealingLR(optimizer, num_epochs)
     # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60], gamma=0.1)
 
     # print(model)
     for epoch in range(num_epochs):
-        model.train().to(device)
+        model.train()
         running_loss = 0.0
         for batch_idx, batch in enumerate(train_loader):
             optimizer.zero_grad()
@@ -676,12 +682,12 @@ if __name__ == "__main__":
 
     train_loader = train_loader_x
     val_loader = test_loader
-    if not os.path.exists(args.path):
-        os.makedirs(args.path)
+    if not os.path.exists(arg.path):
+        os.makedirs(arg.path)
     model = wrap_model(model)
     if arg.dataset != 'ImageNet':
         model = finetune(model, train_loader)
     torch.cuda.empty_cache()
-    rap_attack(model, test_loader, root=args.path)
+    rap_attack(model, test_loader, root=arg.path)
 
 

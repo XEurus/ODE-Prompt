@@ -16,21 +16,21 @@ SEED=1
 
 DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/mlp8
 PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
-echo "--------------------------------------------------------------------------------------"
-$PYTHON train.py \
---root ${D} \
---adv-training \
---seed ${SEED} \
---trainer ${TRAINER} \
---dataset-config-file configs/datasets/${DATASET}.yaml \
---config-file configs/trainers/${TRAINER}/${CFG}.yaml \
---output-dir ${DIR} \
---model-dir ${DIR} \
---adv-training \
---model-file ${MODEL_FILE} \
-TRAINER.ADV.N_CTX ${NCTX} \
-TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
-TRAINER.ADV.CSC ${CSC}
+# echo "--------------------------------------------------------------------------------------"
+# $PYTHON train.py \
+# --root ${D} \
+# --adv-training \
+# --seed ${SEED} \
+# --trainer ${TRAINER} \
+# --dataset-config-file configs/datasets/${DATASET}.yaml \
+# --config-file configs/trainers/${TRAINER}/${CFG}.yaml \
+# --output-dir ${DIR} \
+# --model-dir ${DIR} \
+# --adv-training \
+# --model-file ${MODEL_FILE} \
+# TRAINER.ADV.N_CTX ${NCTX} \
+# TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
+# TRAINER.ADV.CSC ${CSC}
 
 
 
@@ -54,4 +54,4 @@ $PYTHON train.py \
 --output-dir ${DIR}/eval \
 --model-dir /home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16_ep100/adv/mlp8 \
 --model-file ${MODEL_FILE} \
---eval-only
+--eval-black
