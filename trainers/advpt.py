@@ -45,7 +45,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/clip')
+    model_path = clip._download(url, '/home/dji/Project/ODE-Prompt/Adversarial-Prompt-Tuning/clip')
 
     try:
         # loading JIT archive
@@ -53,7 +53,7 @@ def load_clip_to_cpu(cfg):
         state_dict = None
 
     except RuntimeError:
-        state_dict = torch.load(model_path, map_location="cpu")
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
 
     model = clip.build_model(state_dict or model.state_dict())
 
@@ -91,7 +91,7 @@ class ODEFunc(nn.Module):
         dp(t)/dt = f_θ(p(t), z_v)
     
     其中:
-        - p(t): 当前时刻的提示状态，end形状 (n_ctx, dim)
+        - p(t): 当前时刻的提示状态，形状 (n_ctx, dim)
         - z_v: 对抗图像的视觉特征，形状 (batch_size, dim)
         
     网络设计:
@@ -112,37 +112,26 @@ class ODEFunc(nn.Module):
         
         # 主网络: 使用 Residual MLP 替代简单的 MLP
         # 增加网络容量，有助于学习更复杂的动力学
-        self.hidden_dim = prompt_dim * 2
+        self.hidden_dim = prompt_dim * 8
         
         self.input_proj = nn.Linear(prompt_dim + visual_dim, self.hidden_dim)
-        self.norm_in = nn.LayerNorm(self.hidden_dim)
+        # self.norm_in = nn.LayerNorm(self.hidden_dim)
         self.act = nn.GELU()
-        
-        # 残差块 1
-        self.res1_fc1 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res1_norm1 = nn.LayerNorm(self.hidden_dim)
-        self.res1_act = nn.GELU()
-        self.res1_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res1_norm2 = nn.LayerNorm(self.hidden_dim)
 
-        # 残差块 2
-        self.res2_fc1 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res2_norm1 = nn.LayerNorm(self.hidden_dim)
-        self.res2_act = nn.GELU()
-        self.res2_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.res2_norm2 = nn.LayerNorm(self.hidden_dim)
-
-        # 可动态创建任意深度的残差块
+        self.mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
+        )
         
-        self.res_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim)
-            ) for _ in range(16)  # 1 个残差块
-        ])
+        # self.res_blocks = nn.ModuleList([
+        #     nn.Sequential(
+        #         nn.Linear(self.hidden_dim, self.hidden_dim),
+        #         nn.LayerNorm(self.hidden_dim),
+        #         nn.GELU(),
+        #         nn.Linear(self.hidden_dim, self.hidden_dim),
+        #         nn.LayerNorm(self.hidden_dim)
+        #     ) for _ in range(1)  # 1 个残差块
+        # ])
         
         # 输出投影
         self.output_proj = nn.Linear(self.hidden_dim, prompt_dim)
@@ -190,45 +179,8 @@ class ODEFunc(nn.Module):
         
         # Residual MLP 前向传播
         x = self.input_proj(inp)
-        x = self.norm_in(x)
-        x = self.act(x)
-        
-        # # 残差块 1
-        # identity = x
-        # out = self.res1_fc1(x)
-        # out = self.res1_norm1(out)
-        # out = self.res1_act(out)
-        # out = self.res1_fc2(out)
-        # out = self.res1_norm2(out)
-        # x = identity + out  # Skip connection
-        # x = self.act(x)
-        
-        # # 残差块 2
-        # identity = x
-        # out = self.res2_fc1(x)
-        # out = self.res2_norm1(out)
-        # out = self.res2_act(out)
-        # out = self.res2_fc2(out)
-        # out = self.res2_norm2(out)
-        
-        # # 增加缩放因子 (Scale Factor)
-        # # 对于深层 ResNet，缩放残差分支有助于稳定信号传播
-        # # 这在 Neural ODE 中尤为重要，可以降低刚性 (Stiffness)
-        # #out = out * 0.2  
-        
-        # x = identity + out  # Skip connection
-        # x = self.act(x)
-
-        # 循环经过所有额外的残差块
-        for block in self.res_blocks:
-            identity = x
-            out = block(x)
-            
-            # 同样对深层块应用缩放
-            out = out * 0.2
-            
-            x = identity + out
-            x = self.act(x)
+        x = self.act(x) 
+        x = self.mlp(x)
         
         # 输出层
         dp_dt = self.output_proj(x)
@@ -671,7 +623,7 @@ class AdvPT(TrainerX):
         label = label.to(self.device)
         return input, label
 
-    def load_model(self, directory, epoch=None):
+    def load_model(self, directory, epoch=None, model_file=None):
         """
         加载模型权重
         
@@ -690,10 +642,12 @@ class AdvPT(TrainerX):
         names = self.get_model_names()
 
         # By default, the best model is loaded
-        model_file = "model-best.pth.tar"
+        if model_file is None:
+            raise ValueError("model_file is required")
+            # model_file = "model-best.pth.tar"
 
         if epoch is not None:
-            model_file = "model.pth.tar-" + str(epoch)
+            model_file = model_file + "-" + str(epoch)
 
         for name in names:
             model_path = osp.join(directory, name, model_file)
@@ -720,5 +674,17 @@ class AdvPT(TrainerX):
                 del state_dict["ctx"]
 
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
+            
+            # Debug: 检查键名匹配情况
+            model_keys = set(self._models[name].state_dict().keys())
+            loaded_keys = set(state_dict.keys())
+            missing_keys = model_keys - loaded_keys
+            unexpected_keys = loaded_keys - model_keys
+            
+            if missing_keys:
+                print(f"[Warning] Missing keys in state_dict: {list(missing_keys)[:5]} ... (Total: {len(missing_keys)})")
+            if unexpected_keys:
+                print(f"[Warning] Unexpected keys in state_dict: {list(unexpected_keys)[:5]} ... (Total: {len(unexpected_keys)})")
+            
             # set strict=False 以允许缺失的键
             self._models[name].load_state_dict(state_dict, strict=False)
