@@ -642,6 +642,7 @@ class SimpleTrainer(TrainerBase):
         黑盒测试前的准备。
         """
         pkl_path = '{}/{}_{}.pkl'.format(path, self.cfg.DATASET.NAME, attack)
+        print("black test pkl_path:", pkl_path)
         mean_value, std_value = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
         mean = torch.tensor(mean_value).view(-1, 1, 1)
         std = torch.tensor(std_value).view(-1, 1, 1)

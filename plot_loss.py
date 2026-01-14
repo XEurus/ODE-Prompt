@@ -3,8 +3,8 @@ import matplotlib.pyplot as plt
 import os
 
 # Define file paths
-log_file = "/home/dji/Project/ODE-Prompt/Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16/adv/log.txt-2026-01-09-22-20-09"
-output_file = "/home/dji/Project/ODE-Prompt/Adversarial-Prompt-Tuning/loss_curve_advpt_oxford_pets_vit_b16.png"
+log_file = "/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16/adv/resnet_no_mean/log.txt"
+output_file = "/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/loss_curve_advpt_oxford_pets_vit_b16.png"
 
 # Check if log file exists
 if not os.path.exists(log_file):

@@ -45,7 +45,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/home/dji/Project/ODE-Prompt/Adversarial-Prompt-Tuning/clip')
+    model_path = clip._download(url, '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/clip')
 
     try:
         # loading JIT archive
@@ -112,7 +112,7 @@ class ODEFunc(nn.Module):
         
         # 主网络: 使用 Residual MLP 替代简单的 MLP
         # 增加网络容量，有助于学习更复杂的动力学
-        self.hidden_dim = prompt_dim * 8
+        self.hidden_dim = prompt_dim * 2
         
         self.input_proj = nn.Linear(prompt_dim + visual_dim, self.hidden_dim)
         # self.norm_in = nn.LayerNorm(self.hidden_dim)
@@ -123,15 +123,16 @@ class ODEFunc(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
         )
         
-        # self.res_blocks = nn.ModuleList([
-        #     nn.Sequential(
-        #         nn.Linear(self.hidden_dim, self.hidden_dim),
-        #         nn.LayerNorm(self.hidden_dim),
-        #         nn.GELU(),
-        #         nn.Linear(self.hidden_dim, self.hidden_dim),
-        #         nn.LayerNorm(self.hidden_dim)
-        #     ) for _ in range(1)  # 1 个残差块
-        # ])
+        self.res_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.GELU()
+            ) for _ in range(2)  # 2 个残差块
+        ])
         
         # 输出投影
         self.output_proj = nn.Linear(self.hidden_dim, prompt_dim)
@@ -147,10 +148,9 @@ class ODEFunc(nn.Module):
         
         参数:
             z_v: 对抗图像嵌入，形状 (batch_size, visual_dim)
-                 我们取 batch 均值作为全局条件
         """
-        # 取 batch 均值，得到形状 (visual_dim,)
-        self.z_v = z_v.mean(dim=0)  
+        # 移除 batch 均值，保留每个样本的独立特征
+        self.z_v = z_v  # (batch_size, visual_dim)
 
     def forward(self, t, p):
         """
@@ -158,29 +158,31 @@ class ODEFunc(nn.Module):
         
         参数:
             t: 当前时间点 (标量，ODE 求解器需要，但我们的动力学是时间无关的)
-            p: 当前提示状态，形状 (n_ctx, prompt_dim)
+            p: 当前提示状态，形状 (batch_size, n_ctx, prompt_dim)
         
         返回:
-            dp/dt: 提示状态的变化率，形状 (n_ctx, prompt_dim)
+            dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
         """
         if self.z_v is None:
             raise RuntimeError("必须先调用 set_visual_feature() 设置视觉特征！")
         
-        # p 的形状: (n_ctx, prompt_dim)
-        # z_v 的形状: (visual_dim,)
+        # p 的形状: (batch_size, n_ctx, prompt_dim)
+        # z_v 的形状: (batch_size, visual_dim)
         
         # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
-        # 扩展后形状: (n_ctx, visual_dim)
-        z_v_expanded = self.z_v.unsqueeze(0).expand(p.shape[0], -1)
+        # 扩展后形状: (batch_size, n_ctx, visual_dim)
+        z_v_expanded = self.z_v.unsqueeze(1).expand(-1, p.shape[1], -1)
         
         # 拼接: [p(t); z_v]
-        # 形状: (n_ctx, prompt_dim + visual_dim)
+        # 形状: (batch_size, n_ctx, prompt_dim + visual_dim)
         inp = torch.cat([p, z_v_expanded], dim=-1)
         
         # Residual MLP 前向传播
         x = self.input_proj(inp)
         x = self.act(x) 
-        x = self.mlp(x)
+        #x = self.mlp(x)
+        for block in self.res_blocks:
+            x = x + block(x)
         
         # 输出层
         dp_dt = self.output_proj(x)
@@ -292,7 +294,7 @@ class PromptLearner(nn.Module):
                  来自 Adversarial Embedding Bank
         
         返回:
-            prompts: 完整的提示嵌入，形状 (n_cls, seq_len, dim)
+            prompts: 完整的提示嵌入，形状 (batch_size, n_cls, seq_len, dim)
         
         流程:
             1. 设置视觉特征到 ODE 网络
@@ -303,15 +305,16 @@ class PromptLearner(nn.Module):
         # Step 1: 设置视觉特征条件
         # =========================================================
         # z_v 形状: (batch_size, visual_dim)
-        # ODE 网络会取 batch 均值作为全局条件
+        # ODE 网络不再取平均，而是保留每个样本的特征
+        bs = z_v.shape[0]
         self.ode_func.set_visual_feature(z_v)
         
         # =========================================================
         # Step 2: ODE 求解 - 核心步骤!
         # =========================================================
         # 初始状态: p(0) = "a photo of a" 的嵌入
-        # 形状: (n_ctx, prompt_dim)
-        p0 = self.p0
+        # 形状: (n_ctx, prompt_dim) -> (batch_size, n_ctx, prompt_dim)
+        p0 = self.p0.unsqueeze(0).expand(bs, -1, -1)
         
         # 时间点: [0, 1]  -> 表示从 t=0 演化到 t=1
         t = self.ode_t.to(p0.device)
@@ -319,49 +322,47 @@ class PromptLearner(nn.Module):
         # 求解 ODE:
         # p(T) = p(0) + ∫_0^T f_θ(p(t), z_v) dt
         # 
-        # odeint 返回形状: (len(t), n_ctx, prompt_dim)
+        # odeint 返回形状: (len(t), batch_size, n_ctx, prompt_dim)
         # 我们取 [1] 即 t=1 时刻的状态
         p_trajectory = odeint(
             self.ode_func,      # 导数函数 dp/dt = f_θ(p, z_v)
             p0,                 # 初始状态 p(0)
             t,                  # 时间点 [0, 1]
             method='dopri5',    # Dormand-Prince 5 (自适应步长)
-            rtol=1e-3,          # 放宽误差容限以避免 underflow
-            atol=1e-3,          
+            rtol=5e-6,          # 放宽误差容限以避免 underflow
+            atol=5e-6,          
             adjoint_method='dopri5',        
-            adjoint_rtol=1e-3,
-            adjoint_atol=1e-3,
-            options={'safety': 0.1, 'min_step': 1e-3} # 强制设置最小步长，防止 underflow
+            adjoint_rtol=5e-6,
+            adjoint_atol=5e-6,
+            options={'min_step': 1e-6} # 强制设置最小步长，防止 underflow
         )
         
         # 取终端状态 p(T)
-        # 形状: (n_ctx, prompt_dim)
+        # 形状: (batch_size, n_ctx, prompt_dim)
         ctx = p_trajectory[1]  # t=1 时刻的状态
         
         # =========================================================
         # Step 3: 扩展到所有类别
         # =========================================================
-        # ctx 形状: (n_ctx, prompt_dim) -> (n_cls, n_ctx, prompt_dim)
-        # 所有类别共享相同的演化后提示
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+        # ctx 形状: (batch_size, n_ctx, prompt_dim) -> (batch_size, n_cls, n_ctx, prompt_dim)
+        ctx = ctx.unsqueeze(1).expand(-1, self.n_cls, -1, -1)
 
         # =========================================================
         # Step 4: 拼接完整 prompt
         # =========================================================
-        # prefix: SOS token，形状 (n_cls, 1, dim)
-        # suffix: [class_name, EOS]，形状 (n_cls, *, dim)
-        prefix = self.token_prefix
-        suffix = self.token_suffix
+        # prefix: SOS token，形状 (n_cls, 1, dim) -> (batch_size, n_cls, 1, dim)
+        # suffix: [class_name, EOS]，形状 (n_cls, *, dim) -> (batch_size, n_cls, *, dim)
+        prefix = self.token_prefix.unsqueeze(0).expand(bs, -1, -1, -1)
+        suffix = self.token_suffix.unsqueeze(0).expand(bs, -1, -1, -1)
 
         if self.class_token_position == "end":
             prompts = torch.cat(
                 [
-                    prefix,  # (n_cls, 1, dim)
-                    ctx,     # (n_cls, n_ctx, dim)
-                    suffix,  # (n_cls, *, dim)
+                    prefix,  # (bs, n_cls, 1, dim)
+                    ctx,     # (bs, n_cls, n_ctx, dim)
+                    suffix,  # (bs, n_cls, *, dim)
                 ],
-                dim=1,
+                dim=2,
             )
 
         elif self.class_token_position == "middle":
@@ -369,43 +370,43 @@ class PromptLearner(nn.Module):
             prompts = []
             for i in range(self.n_cls):
                 name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
-                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
+                prefix_i = prefix[:, i : i + 1, :, :]
+                class_i = suffix[:, i : i + 1, :name_len, :]
+                suffix_i = suffix[:, i : i + 1, name_len:, :]
+                ctx_i_half1 = ctx[:, i : i + 1, :half_n_ctx, :]
+                ctx_i_half2 = ctx[:, i : i + 1, half_n_ctx:, :]
                 prompt = torch.cat(
                     [
-                        prefix_i,     # (1, 1, dim)
-                        ctx_i_half1,  # (1, n_ctx//2, dim)
-                        class_i,      # (1, name_len, dim)
-                        ctx_i_half2,  # (1, n_ctx//2, dim)
-                        suffix_i,     # (1, *, dim)
+                        prefix_i,     # (bs, 1, 1, dim)
+                        ctx_i_half1,  # (bs, 1, n_ctx//2, dim)
+                        class_i,      # (bs, 1, name_len, dim)
+                        ctx_i_half2,  # (bs, 1, n_ctx//2, dim)
+                        suffix_i,     # (bs, 1, *, dim)
                     ],
-                    dim=1,
+                    dim=2,
                 )
                 prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
+            prompts = torch.cat(prompts, dim=1)
 
         elif self.class_token_position == "front":
             prompts = []
             for i in range(self.n_cls):
                 name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i = ctx[i : i + 1, :, :]
+                prefix_i = prefix[:, i : i + 1, :, :]
+                class_i = suffix[:, i : i + 1, :name_len, :]
+                suffix_i = suffix[:, i : i + 1, name_len:, :]
+                ctx_i = ctx[:, i : i + 1, :, :]
                 prompt = torch.cat(
                     [
-                        prefix_i,  # (1, 1, dim)
-                        class_i,   # (1, name_len, dim)
-                        ctx_i,     # (1, n_ctx, dim)
-                        suffix_i,  # (1, *, dim)
+                        prefix_i,  # (bs, 1, 1, dim)
+                        class_i,   # (bs, 1, name_len, dim)
+                        ctx_i,     # (bs, 1, n_ctx, dim)
+                        suffix_i,  # (bs, 1, *, dim)
                     ],
-                    dim=1,
+                    dim=2,
                 )
                 prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
+            prompts = torch.cat(prompts, dim=1)
 
         else:
             raise ValueError
@@ -450,18 +451,28 @@ class CustomCLIP(nn.Module):
         # Step 2: ODE 演化提示
         # 注意: 这里使用干净图像的特征作为 z_v
         # 在训练时，会使用 forward_embedding 传入对抗特征
-        prompts = self.prompt_learner(image_features)
+        prompts = self.prompt_learner(image_features) # (bs, n_cls, seq_len, dim)
         
         # Step 3: 编码提示
-        tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
+        # 需要将 prompts 和 tokenized_prompts 展平以适配 TextEncoder
+        bs, n_cls, n_ctx, dim = prompts.shape
+        prompts_flat = prompts.reshape(bs * n_cls, n_ctx, dim)
+        
+        tokenized_prompts = self.tokenized_prompts # (n_cls, seq_len)
+        tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
+        
+        text_features = self.text_encoder(prompts_flat, tokenized_prompts_flat) # (bs*n_cls, dim)
+        text_features = text_features.view(bs, n_cls, -1) # (bs, n_cls, dim)
 
         # Step 4: 归一化并计算相似度
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True) # (bs, dim)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True) # (bs, n_cls, dim)
 
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
+        
+        # 计算相似度: (bs, dim) 与 (bs, n_cls, dim) 的交互
+        # logits[i, j] = image_features[i] @ text_features[i, j]
+        logits = logit_scale * torch.einsum("bd,bnd->bn", image_features, text_features)
 
         return logits
 
@@ -491,11 +502,17 @@ class CustomCLIP(nn.Module):
         # 核心: 将对抗图像嵌入传给 PromptLearner
         # 这里 z_v = image_features 来自 Embedding Bank
         # =========================================================
-        prompts = self.prompt_learner(image_features)  # ODE 演化!
+        prompts = self.prompt_learner(image_features)  # (bs, n_cls, seq_len, dim)
         
         # 编码提示
+        bs, n_cls, n_ctx, dim = prompts.shape
+        prompts_flat = prompts.reshape(bs * n_cls, n_ctx, dim)
+        
         tokenized_prompts = self.tokenized_prompts
-        text_features = self.text_encoder(prompts, tokenized_prompts)
+        tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
+        
+        text_features = self.text_encoder(prompts_flat, tokenized_prompts_flat) # (bs*n_cls, dim)
+        text_features = text_features.view(bs, n_cls, -1) # (bs, n_cls, dim)
 
         # 归一化
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -503,7 +520,8 @@ class CustomCLIP(nn.Module):
 
         # 计算相似度分数
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
+        # logits[i, j] = image_features[i] @ text_features[i, j]
+        logits = logit_scale * torch.einsum("bd,bnd->bn", image_features, text_features)
 
         return logits
 

@@ -289,7 +289,7 @@ def main(args):
         print('---------------------------------------------------')
         
         # 2. 白盒对抗攻击测试（如 PGD）
-        print('robust acc:')
+        print('robust acc(PGD):')
         trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
         # 3. 自适应攻击测试
@@ -308,15 +308,25 @@ def main(args):
         print(args.model_dir)
         print('---------------------------------------------------')
         
-        # # 1. 干净样本准确率测试
-        # print('clean acc:')
-        # trainer.test()
-        # print('---------------------------------------------------')
+        # 1. 干净样本准确率测试
+        print('clean acc:')
+        trainer.test()
+        print('---------------------------------------------------')
         
         # 2. 黑盒对抗攻击测试（如 RAP、SIA）
-        print('robust acc:')
+        print('robust acc(RAP):')
         trainer.before_black_test(args.path, args.black_attack)
         trainer.test_adv()
+        print('---------------------------------------------------')
+
+        print('robust acc(PGD):')
+        trainer.before_adv_test(args.path, args.white_attack)
+        trainer.test_adv()
+        print('---------------------------------------------------')
+
+        print('adaptive attack acc:')
+        trainer.test_adaptive_attack()
+        print('---------------------------------------------------')
         return
 
     # ========================================================================
@@ -335,9 +345,20 @@ def main(args):
         print('clean acc:')
         trainer.test()
         print('---------------------------------------------------')
-        print('robust acc:')
+        print('robust acc(RAP):')
+        trainer.before_black_test(args.path, args.black_attack)
+        trainer.test_adv()
+        print('---------------------------------------------------')
+
+        print('robust acc(PGD):')
         trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
+        print('---------------------------------------------------')
+
+        print('adaptive attack acc:')
+        trainer.test_adaptive_attack()
+        print('---------------------------------------------------')
+        return
 
 
 

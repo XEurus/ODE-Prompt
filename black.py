@@ -622,7 +622,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--source_model', type=str, default='resnet50',
                         choices=['resnet50', 'inception-v3', 'densenet121', 'vgg16bn'])
-    parser.add_argument('--batch_size', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--max_iterations', type=int, default=400)
     parser.add_argument('--loss_function', type=str, default='MaxLogit', choices=['CE', 'MaxLogit'])
     parser.add_argument('--targeted', action='store_true')
@@ -643,7 +643,7 @@ if __name__ == "__main__":
     parser.add_argument('--random_start', default=True)
     parser.add_argument('--save', default=True)
     parser.add_argument('--dataset', type=str, default='OxfordPets')
-    parser.add_argument('--root', type=str)
+    parser.add_argument('--root', type=str, default='./Data')
     parser.add_argument("--path", type=str, default="./pkl_data/", help="directory of pkl")
     arg = parser.parse_args()
 
