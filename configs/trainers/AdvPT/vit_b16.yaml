@@ -3,8 +3,8 @@ DATALOADER:
     BATCH_SIZE: 32
     BATCH_EMBEDDING_SIZE: 32
   TEST:
-    BATCH_SIZE: 1
-  NUM_WORKERS: 8
+    BATCH_SIZE: 32
+  NUM_WORKERS: 16
 
 INPUT:
   SIZE: (224, 224)
@@ -16,7 +16,7 @@ INPUT:
 OPTIM:
   NAME: "sgd"
   LR: 0.002
-  MAX_EPOCH: 40
+  MAX_EPOCH: 80
   LR_SCHEDULER: "cosine"
   WARMUP_EPOCH: 1
   WARMUP_TYPE: "constant"
@@ -24,6 +24,13 @@ OPTIM:
 
 TRAIN:
   PRINT_FREQ: 5
+  CHECKPOINT_FREQ: 10  # 每10个epoch保存一次检查点
+
+TEST:
+  NO_TEST: False
+  FINAL_MODEL: "best_val"  # 启用每个epoch的测试
+  SPLIT: "test"
+  EPOCH_TEST_BATCHES: 20  # 每个epoch测试的batch数量（部分测试以节省时间）
 
 MODEL:
   BACKBONE:

@@ -45,7 +45,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/clip')
+    model_path = clip._download(url, '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/clip')
 
     try:
         # loading JIT archive
@@ -329,12 +329,12 @@ class PromptLearner(nn.Module):
             p0,                 # 初始状态 p(0)
             t,                  # 时间点 [0, 1]
             method='dopri5',    # Dormand-Prince 5 (自适应步长)
-            rtol=5e-6,          # 放宽误差容限以避免 underflow
-            atol=5e-6,          
+            rtol=1e-5,          # 放宽误差容限以避免 underflow
+            atol=1e-5,          
             adjoint_method='dopri5',        
-            adjoint_rtol=5e-6,
-            adjoint_atol=5e-6,
-            options={'min_step': 1e-6} # 强制设置最小步长，防止 underflow
+            adjoint_rtol=1e-5,
+            adjoint_atol=1e-5,
+            options={'min_step': 5e-6} # 强制设置最小步长，防止 underflow
         )
         
         # 取终端状态 p(T)
@@ -566,6 +566,15 @@ class AdvPT(TrainerX):
             if "prompt_learner" not in name:
                 param.requires_grad_(False)
         
+        # =========================================================
+        # 关键修复：确保 image_encoder 和 text_encoder 始终为 eval 模式
+        # 对于含有 BatchNorm/Dropout 的模型（如 ResNet），train/eval 模式行为不同
+        # 由于这些编码器是冻结的，必须始终使用 eval 模式以保持一致性
+        # =========================================================
+        self.model.image_encoder.eval()
+        self.model.text_encoder.eval()
+        print("[ODE-Prompt] Set image_encoder and text_encoder to eval mode (frozen)")
+        
         # 统计可学习参数
         n_params = sum(p.numel() for p in self.model.prompt_learner.parameters() if p.requires_grad)
         print(f"[ODE-Prompt] Trainable parameters: {n_params:,} (only ODE network f_θ)")
@@ -587,6 +596,22 @@ class AdvPT(TrainerX):
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
+
+    def set_model_mode(self, mode="train", names=None):
+        """
+        重写 set_model_mode 以确保冻结的编码器始终处于 eval 模式
+        
+        无论是训练还是测试模式，image_encoder 和 text_encoder 都必须保持 eval 模式
+        这对于含有 BatchNorm 的模型（如 ResNet backbone）尤为重要
+        """
+        # 调用父类方法设置 prompt_learner 的模式
+        super().set_model_mode(mode, names)
+        
+        # 关键修复：确保冻结的编码器始终为 eval 模式
+        # 获取实际的模型（处理 DataParallel 包装的情况）
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        model.image_encoder.eval()
+        model.text_encoder.eval()
 
     def forward_backward_adv(self, batch_dict):
         batch, embedding_adv = batch_dict['batch'], batch_dict['images_adv']
@@ -640,6 +665,212 @@ class AdvPT(TrainerX):
         input = input.to(self.device)
         label = label.to(self.device)
         return input, label
+
+
+    def after_epoch(self):
+        """
+        每个epoch结束后进行快速测试（干净样本 + 对抗样本）
+        
+        这个方法会：
+        1. 测试当前训练模型的干净样本准确率（仅测试部分数据）
+        2. 测试对抗样本鲁棒性（如果已准备，仅测试部分数据）
+        3. 保存最佳模型
+        4. 记录训练进度到TensorBoard
+        
+        注意：为了节省时间，每个epoch只测试部分数据集
+        """
+        last_epoch = (self.epoch + 1) == self.max_epoch
+        do_test = not self.cfg.TEST.NO_TEST
+        
+        if not do_test:
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"Epoch {self.epoch + 1}/{self.max_epoch} - Quick Testing (Partial Dataset)")
+        print(f"{'='*80}")
+        
+        # 验证模型状态：打印 ODE 网络的一些权重统计信息
+        try:
+            if hasattr(self.model, 'module'):  # DataParallel 包装的情况
+                ode_func = self.model.module.prompt_learner.ode_func
+            else:
+                ode_func = self.model.prompt_learner.ode_func
+            
+            input_proj_sum = ode_func.input_proj.weight.sum().item()
+            output_proj_sum = ode_func.output_proj.weight.sum().item()
+            print(f"[Model State Verification]")
+            print(f"  ODE input_proj weight sum:  {input_proj_sum:.6f}")
+            print(f"  ODE output_proj weight sum: {output_proj_sum:.6f}")
+        except Exception as e:
+            print(f"[Warning] Could not verify model state: {e}")
+        
+        # 获取每个epoch测试的batch数量（可配置）
+        max_batches = self.cfg.TEST.EPOCH_TEST_BATCHES if hasattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES') else 20
+        
+        # 1. 干净样本测试（仅测试部分数据）
+        if max_batches > 0:
+            print(f'\n[1/2] Clean Sample Accuracy (Partial):')
+            clean_acc = self.test_partial(split="test", max_batches=max_batches)
+            print(f"      Result: {clean_acc:.2f}% (tested ~{max_batches * self.cfg.DATALOADER.TEST.BATCH_SIZE} samples)")
+        else:
+            # 如果设置为-1，则测试完整数据集
+            print(f'\n[1/2] Clean Sample Accuracy (Full Dataset):')
+            clean_acc = self.test(split="test")
+            print(f"      Result: {clean_acc:.2f}%")
+        
+        # 2. 对抗样本测试（如果已经准备好，仅测试部分数据）
+        robust_acc = None
+        if hasattr(self, 'test_pkl') and self.test_pkl is not None:
+            if max_batches > 0:
+                print(f'\n[2/2] Adversarial Robustness (PGD, Partial):')
+                robust_acc = self.test_adv_partial(split="test", max_batches=max_batches)
+                print(f"      Result: {robust_acc:.2f}% (tested ~{max_batches * self.cfg.DATALOADER.TEST.BATCH_SIZE} samples)")
+            else:
+                # 如果设置为-1，则测试完整数据集
+                print(f'\n[2/2] Adversarial Robustness (PGD, Full Dataset):')
+                robust_acc = self.test_adv(split="test")
+                print(f"      Result: {robust_acc:.2f}%")
+        else:
+            print(f'\n[2/2] Adversarial test skipped (test_pkl not prepared)')
+        
+        # 记录到TensorBoard
+        self.write_scalar("epoch/clean_acc", clean_acc, self.epoch)
+        if robust_acc is not None:
+            self.write_scalar("epoch/robust_acc", robust_acc, self.epoch)
+            # 计算准确率差距（用于监控过拟合）
+            acc_gap = clean_acc - robust_acc
+            self.write_scalar("epoch/acc_gap", acc_gap, self.epoch)
+        
+        # 保存最佳模型（基于干净样本准确率）
+        is_best = clean_acc > self.best_result
+        if is_best:
+            self.best_result = clean_acc
+            self.save_model(
+                self.epoch,
+                self.output_dir,
+                val_result=clean_acc,
+                is_best=True
+            )
+            print(f"\n{'*'*80}")
+            print(f"*** NEW BEST MODEL SAVED ***")
+            print(f"    Epoch: {self.epoch + 1}/{self.max_epoch}")
+            print(f"    Clean Acc: {clean_acc:.2f}%")
+            if robust_acc is not None:
+                print(f"    Robust Acc: {robust_acc:.2f}%")
+                print(f"    Gap: {acc_gap:.2f}%")
+            print(f"{'*'*80}")
+        else:
+            print(f"\n[Best Model Status]")
+            print(f"    Current Clean Acc: {clean_acc:.2f}%")
+            print(f"    Best Clean Acc: {self.best_result:.2f}%")
+        
+        # 定期保存检查点
+        meet_checkpoint_freq = (
+            (self.epoch + 1) % self.cfg.TRAIN.CHECKPOINT_FREQ == 0
+            if self.cfg.TRAIN.CHECKPOINT_FREQ > 0 else False
+        )
+        if meet_checkpoint_freq or last_epoch:
+            self.save_model(self.epoch, self.output_dir)
+            print(f"[Checkpoint Saved] Epoch {self.epoch + 1}")
+        
+        print(f"{'='*80}\n")
+
+    @torch.no_grad()
+    def test_partial(self, split=None, max_batches=20):
+        """
+        部分数据集测试（干净样本）- 用于每个epoch的快速评估
+        
+        参数:
+            split: 数据集划分 ('test' or 'val')
+            max_batches: 最多测试的batch数量
+        
+        返回:
+            准确率 (%)
+        """
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"
+            data_loader = self.test_loader
+
+        print(f"Evaluate on the *{split}* set (first {max_batches} batches)")
+
+        for batch_idx, batch in enumerate(data_loader):
+            if batch_idx >= max_batches:
+                break
+            input, label = self.parse_batch_test(batch)
+            output = self.model_inference(input)
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+        return list(results.values())[0]
+
+    @torch.no_grad()
+    def test_adv_partial(self, split=None, max_batches=20):
+        """
+        部分数据集对抗测试 - 用于每个epoch的快速评估
+        
+        参数:
+            split: 数据集划分 ('test' or 'val')
+            max_batches: 最多测试的batch数量
+        
+        返回:
+            鲁棒准确率 (%)
+        """
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"
+            data_loader = self.test_loader
+
+        array_to_pkl = self.test_pkl
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1).to(self.device)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1).to(self.device)
+
+        print(f"Evaluate on the *{split}* set (first {max_batches} batches)")
+
+        for batch_idx, batch in enumerate(data_loader):
+            if batch_idx >= max_batches:
+                break
+            input, label = self.parse_batch_test(batch)
+            # 获取对应的对抗样本
+            input_adv = array_to_pkl[batch_idx * data_loader.batch_size: (batch_idx + 1) * data_loader.batch_size]
+            input_adv = input_adv.to(input.device)
+
+            # 限制噪声幅度
+            test_eps = self.cfg.DATASET.TEST_EPS / 255.0
+            x_adv = input_adv*std + mean
+            x = input*std + mean
+            noise = x_adv-x
+            noise = torch.clamp(noise, -test_eps, test_eps)
+            x_adv = x+noise
+            x_adv = torch.clamp(x_adv, 0, 1)
+            
+            # 验证约束
+            assert (torch.max(x_adv - x) < (test_eps + 1e-6))
+            assert (torch.min(x_adv - x) > (-test_eps - 1e-6))
+            
+            # 重新归一化
+            input_adv = (x_adv-mean)/std
+
+            # 模型推理
+            output = self.model_inference(input_adv)
+            self.evaluator.process(output, label.to(input.device))
+
+        results = self.evaluator.evaluate()
+        return list(results.values())[0]
 
     def load_model(self, directory, epoch=None, model_file=None):
         """
@@ -706,3 +937,22 @@ class AdvPT(TrainerX):
             
             # set strict=False 以允许缺失的键
             self._models[name].load_state_dict(state_dict, strict=False)
+            
+            # =========================================================
+            # 验证 ODE 网络权重是否正确加载
+            # =========================================================
+            ode_func = self._models[name].ode_func
+            print(f"\n[Verify] ODE network loaded successfully")
+            print(f"[Verify] input_proj weight sum: {ode_func.input_proj.weight.sum().item():.6f}")
+            print(f"[Verify] input_proj bias sum: {ode_func.input_proj.bias.sum().item():.6f}")
+            print(f"[Verify] output_proj weight sum: {ode_func.output_proj.weight.sum().item():.6f}")
+            print(f"[Verify] output_proj bias sum: {ode_func.output_proj.bias.sum().item():.6f}")
+            
+            # 检查是否所有 ODE 相关的键都被加载
+            ode_keys = [k for k in state_dict.keys() if 'ode_func' in k]
+            print(f"[Verify] Loaded {len(ode_keys)} ODE-related keys from checkpoint")
+            
+            # 详细列出 ODE 网络的各层权重统计
+            print("[Verify] ODE network layer statistics:")
+            for layer_name, param in ode_func.named_parameters():
+                print(f"  - {layer_name}: shape={list(param.shape)}, mean={param.mean().item():.6f}, std={param.std().item():.6f}")

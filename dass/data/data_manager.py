@@ -37,8 +37,10 @@ def build_data_loader(
         dataset_wrapper = DatasetWrapper
 
     # Build data loader
+    # 使用配置中的 interpolation mode 以确保与测试时的预处理一致
+    interp_mode = INTERPOLATION_MODES.get(cfg.INPUT.INTERPOLATION, INTERPOLATION_MODES["bilinear"])
     transform = transforms.Compose([
-        transforms.Resize(224),
+        transforms.Resize(224, interpolation=interp_mode),
         transforms.CenterCrop(224),
         transforms.ToTensor()
     ])

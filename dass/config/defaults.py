@@ -214,6 +214,9 @@ _C.TEST.SPLIT = "test"
 # If best_val, evaluation is done every epoch (if val data
 # is unavailable, test data will be used)
 _C.TEST.FINAL_MODEL = "last_step"
+# Number of batches to test per epoch (for quick evaluation)
+# Set to -1 to test the entire dataset
+_C.TEST.EPOCH_TEST_BATCHES = 20
 
 ###########################
 # Trainer specifics

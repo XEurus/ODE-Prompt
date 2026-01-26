@@ -5,32 +5,32 @@ TRAINER=AdvPT
 # oxford_flowers, oxford_pets, imagenet, food101, sun397, dtd, eurosat, ucf101
 DATASET=oxford_pets
 # rn50, vit_b16, vit_l14
-CFG=vit_b16_ep100 # config file
+CFG=vit_b16 # config file
 CTP=end  # class token position (end or middle)
 NCTX=32  # number of context tokens
 #SHOTS=16  # number of shots (1, 2, 4, 8, 16)
 CSC=False  # class-specific context (False or True)
-MODEL_FILE=MLP_model.pth.tar-150
+MODEL_FILE=resnet_model.pth.tar-150
 D=$ROOT
 SEED=1
 
-DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/mlp8
+DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/4-0_resnet_PGD40_16_
 PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
-# echo "--------------------------------------------------------------------------------------"
-# $PYTHON train.py \
-# --root ${D} \
-# --adv-training \
-# --seed ${SEED} \
-# --trainer ${TRAINER} \
-# --dataset-config-file configs/datasets/${DATASET}.yaml \
-# --config-file configs/trainers/${TRAINER}/${CFG}.yaml \
-# --output-dir ${DIR} \
-# --model-dir ${DIR} \
-# --adv-training \
-# --model-file ${MODEL_FILE} \
-# TRAINER.ADV.N_CTX ${NCTX} \
-# TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
-# TRAINER.ADV.CSC ${CSC}
+echo "--------------------------------------------------------------------------------------"
+$PYTHON train.py \
+--root ${D} \
+--adv-training \
+--seed ${SEED} \
+--trainer ${TRAINER} \
+--dataset-config-file configs/datasets/${DATASET}.yaml \
+--config-file configs/trainers/${TRAINER}/${CFG}.yaml \
+--output-dir ${DIR} \
+--model-dir ${DIR} \
+--adv-training \
+--model-file ${MODEL_FILE} \
+TRAINER.ADV.N_CTX ${NCTX} \
+TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
+TRAINER.ADV.CSC ${CSC}
 
 
 
@@ -46,12 +46,12 @@ PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/pyt
 # --model-dir /home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16/adv/prompt_learner/8_layer_resnet_model.pth.tar-100 \
 # --eval-only
 
-$PYTHON train.py \
---root ${D} \
---trainer ${TRAINER} \
---dataset-config-file configs/datasets/${DATASET}.yaml \
---config-file configs/trainers/AdvPT/${CFG}.yaml \
---output-dir ${DIR}/eval \
---model-dir /home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16_ep100/adv/mlp8 \
---model-file ${MODEL_FILE} \
---eval-black
+# $PYTHON train.py \
+# --root ${D} \
+# --trainer ${TRAINER} \
+# --dataset-config-file configs/datasets/${DATASET}.yaml \
+# --config-file configs/trainers/AdvPT/${CFG}.yaml \
+# --output-dir ${DIR}/eval \
+# --model-dir /home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16_ep100/adv/mlp8 \
+# --model-file ${MODEL_FILE} \
+# --eval-black

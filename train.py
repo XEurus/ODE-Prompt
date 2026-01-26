@@ -174,8 +174,9 @@ def extend_cfg(cfg):
     # 数据集和数据加载配置
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"         # 子采样策略：all/base/new
     cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256  # 嵌入bank的batch大小
-    cfg.DATASET.TRAIN_EPS = 8                     # 训练扰动强度（8/255 ≈ 0.031）
+    cfg.DATASET.TRAIN_EPS = 16                    # 训练扰动强度（16/255 ≈ 0.063）
     cfg.DATASET.TEST_EPS = 16                     # 测试扰动强度（16/255 ≈ 0.063）
+    cfg.DATASET.PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
 
     cfg.MODEL.FILE_PREFIX = "model"               # 模型文件名前缀
 
@@ -334,9 +335,32 @@ def main(args):
     # ========================================================================
     if not args.no_train:
         if args.adv_training:
+            # =========================================================
+            # 准备对抗训练所需的数据
+            # =========================================================
+            print('='*80)
+            print('Preparing adversarial training data...')
+            print('='*80)
+            
+            # 1. 准备训练集的对抗样本特征（用于训练）
+            print('\n[1/2] Generating/Loading training adversarial features...')
+            trainer.before_adv_train(path=args.path, attack='PGD')
+            print('Training adversarial features ready.')
+            
+            # 2. 准备测试集的对抗样本（用于每个epoch的测试）
+            print('\n[2/2] Generating/Loading test adversarial samples...')
+            trainer.before_adv_test(path=args.path, attack='PGD')
+            print('Test adversarial samples ready.')
+            
+            print('='*80)
+            print('Starting adversarial training with epoch-wise testing...')
+            print('='*80 + '\n')
+            
             # 对抗训练模式：使用对抗样本进行训练
+            # 注意：每个epoch结束后会自动调用 after_epoch() 进行测试
             trainer.train(path=args.path, adv_training=True)
         else:
+            raise "error"
             # 标准训练模式
             trainer.train()
         
@@ -345,26 +369,26 @@ def main(args):
         print('clean acc:')
         trainer.test()
         print('---------------------------------------------------')
-        print('robust acc(RAP):')
-        trainer.before_black_test(args.path, args.black_attack)
-        trainer.test_adv()
-        print('---------------------------------------------------')
+        # print('robust acc(RAP):')
+        # trainer.before_black_test(args.path, args.black_attack)
+        # trainer.test_adv()
+        # print('---------------------------------------------------')
 
         print('robust acc(PGD):')
-        trainer.before_adv_test(args.path, args.white_attack)
+        #trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
         print('---------------------------------------------------')
 
-        print('adaptive attack acc:')
-        trainer.test_adaptive_attack()
-        print('---------------------------------------------------')
+        # print('adaptive attack acc:')
+        # trainer.test_adaptive_attack()
+        # print('---------------------------------------------------')
         return
 
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
+    parser.add_argument("--root", type=str, default="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
     parser.add_argument("--output-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv", help="output directory")
     parser.add_argument("--path", type=str, default="./pkl_data/", help="directory of pkl")
     

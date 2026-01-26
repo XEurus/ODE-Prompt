@@ -533,57 +533,104 @@ class SimpleTrainer(TrainerBase):
     def before_adv_train(self, path, attack='PGD'):
         """
         对抗训练前的准备：生成或加载对抗样本特征。
+        
+        重要修复 (2026-01-26):
+        - 使用 self.model.image_encoder 而不是新加载的 CLIP 模型
+        - 确保与测试时使用完全相同的模型和预处理
+        - 使用带归一化的数据加载器 (train_loader_x_noshuffle 而不是 notransform)
         """
-        # 定义保存对抗特征的pkl文件路径
-        pkl_path = '{}/{}_{}.pkl'.format(path, self.cfg.DATASET.NAME, self.cfg.MODEL.BACKBONE.NAME.replace(
+        # 定义保存对抗特征的pkl文件路径 - 添加 _v2 后缀标识新版本
+        pkl_path = '{}/{}_{}_v2.pkl'.format(path, self.cfg.DATASET.NAME, self.cfg.MODEL.BACKBONE.NAME.replace(
                                                                          "/",
                                                                          "_"))
         # 如果文件存在，直接加载
         if os.path.isfile(pkl_path):
             self.train_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
-            print('loaded train_pkl')
+            print(f'[before_adv_train] Loaded train_pkl from {pkl_path}')
             return
+        
+        print("[before_adv_train] Generating adversarial embeddings...")
+        print("[before_adv_train] Using self.model.image_encoder for consistency with testing")
         
         # 否则开始生成对抗样本特征
         train_eps = self.cfg.DATASET.TRAIN_EPS
         # CLIP模型的归一化参数
-        normalize = transforms.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
-        # 加载CLIP模型
+        mean_val = [0.48145466, 0.4578275, 0.40821073]
+        std_val = [0.26862954, 0.26130258, 0.27577711]
+        normalize = transforms.Normalize(mean_val, std_val)
+        mean = torch.tensor(mean_val).view(-1, 1, 1).to(self.device)
+        std = torch.tensor(std_val).view(-1, 1, 1).to(self.device)
+        
+        # 【关键修复】使用 self.model 的 image_encoder 而不是新加载的模型
+        # 这确保训练和测试使用完全相同的模型
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        image_encoder = model.image_encoder
+        dtype = model.dtype
+        
+        # 构建代理模型用于生成攻击（仍然使用独立的 ClipModel）
+        # 注意：这里仍然用新加载的模型做攻击，但提取特征用 self.model
         clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
-        # 构建代理模型用于生成攻击
+        if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
+            clip_model.float()
         surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
 
         if attack == 'PGD':
-            # 初始化PGD攻击器
-            attacker = PGD(train_eps / 255., preprocess=normalize, num_iters=10)
+            # 初始化PGD攻击器（使用统一的迭代次数配置）
+            num_iters = self.cfg.DATASET.PGD_NUM_ITERS if hasattr(self.cfg.DATASET, 'PGD_NUM_ITERS') else 40
+            attacker = PGD(train_eps / 255., preprocess=normalize, num_iters=num_iters)
+            print(f"[before_adv_train] Using PGD attack with eps={train_eps}/255, iters={num_iters}")
         else:
             attacker = None
 
-        embedding_dim = surrogate.fc.in_features
+        # 获取 embedding 维度
+        embedding_dim = image_encoder.output_dim
+        print(f"[before_adv_train] Embedding dimension: {embedding_dim}")
+        
+        # 【关键修复】使用 train_loader_x_noshuffle（带标准预处理）而不是 notransform_noshuffle
+        # 这确保与测试时的预处理完全一致
+        data_loader = self.train_loader_x_noshuffle
+        
         # 初始化存储特征的张量
-        self.train_pkl = torch.empty(size=[len(self.train_loader_x_notransform_noshuffle.dataset), embedding_dim])
+        self.train_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
+        
+        # 确保 image_encoder 在 eval 模式
+        image_encoder.eval()
         
         # 遍历数据集生成对抗样本并提取特征
-        for batch_idx, batch in enumerate(self.train_loader_x_notransform_noshuffle):
-            inputs = batch['img'].to(self.device)
+        print(f"[before_adv_train] Processing {len(data_loader)} batches...")
+        for batch_idx, batch in enumerate(data_loader):
+            # 图像已经是归一化后的
+            inputs_normalized = batch['img'].to(self.device)
+            
+            # 还原到 [0, 1] 范围用于攻击
+            inputs = inputs_normalized * std + mean
+            inputs = torch.clamp(inputs, 0, 1)
+            
             # 生成对抗样本
             images_adv = attacker.run(surrogate, inputs, scaler=1, feature_layer='fc')
+            
             # 检查扰动范围
             assert torch.max(images_adv - inputs) < (train_eps / 255. + 1e-6)
             assert torch.min(images_adv - inputs) > (-train_eps / 255 - 1e-6)
             
-            images_adv = normalize(images_adv)
-            # 使用CLIP模型提取特征
+            # 归一化对抗样本
+            images_adv_normalized = (images_adv - mean) / std
+            
+            # 【关键修复】使用 self.model.image_encoder 提取特征
             with torch.no_grad():
-                embedding = clip_model.encode_image(images_adv)
+                embedding = image_encoder(images_adv_normalized.type(dtype))
 
             # 保存特征到tensor中
-            self.train_pkl[batch_idx * self.train_loader_x_notransform_noshuffle.batch_size: (
-                                                                                                         batch_idx + 1) * self.train_loader_x_notransform_noshuffle.batch_size] = embedding.cpu()
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + embedding.shape[0]
+            self.train_pkl[start_idx:end_idx] = embedding.cpu().float()
+            
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
 
         # 保存生成的特征到文件
         torch.save(self.train_pkl, pkl_path)
-        print('generated train_pkl')
+        print(f'[before_adv_train] Generated and saved train_pkl to {pkl_path}')
         del surrogate
         torch.cuda.empty_cache()
 
@@ -610,10 +657,19 @@ class SimpleTrainer(TrainerBase):
         test_eps = self.cfg.DATASET.TEST_EPS
 
         if attack == 'PGD':
-            # 加载模型和攻击器
+            # 加载模型和攻击器（使用统一的迭代次数配置）
             temp_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
+            
+            # 关键修复：确保精度与 CustomCLIP 一致
+            if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
+                temp_model.float()
+                print("[before_adv_test] CLIP model converted to fp32 to match training precision")
+            else:
+                print("[before_adv_test] CLIP model using default fp16 precision")
+            
             surrogate = ClipModel(model=get_model(temp_model.visual), num_classes=2).eval().to(self.device)
-            attacker = PGD(test_eps / 255., preprocess=normalize, num_iters=40) # PGD攻击，40次迭代
+            num_iters = self.cfg.DATASET.PGD_NUM_ITERS if hasattr(self.cfg.DATASET, 'PGD_NUM_ITERS') else 40
+            attacker = PGD(test_eps / 255., preprocess=normalize, num_iters=num_iters)
             
             # 遍历测试集生成对抗样本
             for batch_idx, batch in enumerate(self.test_loader):
@@ -736,16 +792,18 @@ class SimpleTrainer(TrainerBase):
             input_adv = input_adv.to(input.device)
 
             # 限制噪声幅度 (claim small noise)
+            # 使用配置中的 TEST_EPS 而不是硬编码值
+            test_eps = self.cfg.DATASET.TEST_EPS / 255.0
             x_adv = input_adv*std + mean
             x = input*std + mean
             noise = x_adv-x
-            noise = torch.clamp(noise, -16 / 255.0, 16/255.0) # 限制噪声在L_inf ball内
+            noise = torch.clamp(noise, -test_eps, test_eps) # 限制噪声在L_inf ball内
             x_adv = x+noise
             x_adv = torch.clamp(x_adv, 0, 1) # 限制图像在[0, 1]范围
             
             # 验证约束
-            assert (torch.max(x_adv - x) < (16/255.0 + 1e-6))
-            assert (torch.min(x_adv - x) > (-16 / 255.0 - 1e-6))
+            assert (torch.max(x_adv - x) < (test_eps + 1e-6))
+            assert (torch.min(x_adv - x) > (-test_eps - 1e-6))
             
             # 重新归一化
             input_adv = (x_adv-mean)/std
