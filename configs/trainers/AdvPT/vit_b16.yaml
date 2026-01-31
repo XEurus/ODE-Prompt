@@ -13,14 +13,25 @@ INPUT:
   PIXEL_STD: [0.26862954, 0.26130258, 0.27577711]
   TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]
 
+# OPTIM:
+#   NAME: "sgd"
+#   LR: 0.002
+#   MAX_EPOCH: 80
+#   LR_SCHEDULER: "cosine"
+#   WARMUP_EPOCH: 5
+#   WARMUP_TYPE: "constant"
+#   WARMUP_CONS_LR: 1e-5
 OPTIM:
   NAME: "sgd"
-  LR: 0.002
+  LR: 0.001
   MAX_EPOCH: 80
-  LR_SCHEDULER: "cosine"
-  WARMUP_EPOCH: 1
-  WARMUP_TYPE: "constant"
-  WARMUP_CONS_LR: 1e-5
+  LR_SCHEDULER: "plateau"
+  PLATEAU_MODE: "min"
+  PLATEAU_FACTOR: 0.1
+  PLATEAU_PATIENCE: 4
+  PLATEAU_THRESHOLD: 1e-4
+  PLATEAU_MIN_LR: 1e-6
+  WARMUP_EPOCH: -1  # plateau 不支持 warmup
 
 TRAIN:
   PRINT_FREQ: 5
@@ -30,7 +41,7 @@ TEST:
   NO_TEST: False
   FINAL_MODEL: "best_val"  # 启用每个epoch的测试
   SPLIT: "test"
-  EPOCH_TEST_BATCHES: 20  # 每个epoch测试的batch数量（部分测试以节省时间）
+  EPOCH_TEST_BATCHES: 10  # 每个epoch测试的batch数量
 
 MODEL:
   BACKBONE:

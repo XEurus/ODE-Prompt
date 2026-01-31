@@ -10,11 +10,12 @@ CTP=end  # class token position (end or middle)
 NCTX=32  # number of context tokens
 #SHOTS=16  # number of shots (1, 2, 4, 8, 16)
 CSC=False  # class-specific context (False or True)
-MODEL_FILE=resnet_model.pth.tar-150
+MODEL_FILE=resnet_model.pth.tar
+Best_Model=resnet_model-best.pth.tar
 D=$ROOT
 SEED=1
 
-DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/4-0_resnet_PGD40_16_
+DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/4-2_resnet_PGD40_16_float32_plateau
 PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
 echo "--------------------------------------------------------------------------------------"
 $PYTHON train.py \
@@ -52,6 +53,6 @@ TRAINER.ADV.CSC ${CSC}
 # --dataset-config-file configs/datasets/${DATASET}.yaml \
 # --config-file configs/trainers/AdvPT/${CFG}.yaml \
 # --output-dir ${DIR}/eval \
-# --model-dir /home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/output/oxford_pets/AdvPT/vit_b16_ep100/adv/mlp8 \
-# --model-file ${MODEL_FILE} \
-# --eval-black
+# --model-dir ${DIR} \
+# --model-file ${Best_Model} \
+# --eval-only

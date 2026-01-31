@@ -11,7 +11,9 @@ from dass.engine import TRAINER_REGISTRY, TrainerX
 from dass.metrics import compute_accuracy
 from dass.utils import load_pretrained_weights, load_checkpoint
 from dass.optim import build_optimizer, build_lr_scheduler
-from torchdiffeq import odeint_adjoint as odeint
+from torchdiffeq import odeint_adjoint
+from torchdiffeq import odeint
+from utils.adv_utils import ImageNormalizer, get_model
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
@@ -123,23 +125,29 @@ class ODEFunc(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
         )
         
-        self.res_blocks = nn.ModuleList([
-            nn.Sequential(
+        self.res_blocks = nn.ModuleList()
+        for _ in range(2):  # 2 个残差块
+            block = nn.Sequential(
                 nn.Linear(self.hidden_dim, self.hidden_dim),
                 nn.LayerNorm(self.hidden_dim),
                 nn.GELU(),
                 nn.Linear(self.hidden_dim, self.hidden_dim),
                 nn.LayerNorm(self.hidden_dim),
                 nn.GELU()
-            ) for _ in range(2)  # 2 个残差块
-        ])
+            )
+            # 关键修复：零初始化残差块的最后一层，确保初始时残差接近零
+            #nn.init.zeros_(block[3].weight)
+            #nn.init.zeros_(block[3].bias)
+            self.res_blocks.append(block)
         
         # 输出投影
         self.output_proj = nn.Linear(self.hidden_dim, prompt_dim)
         
-        # 零初始化最后一层，确保 ODE 初始时接近恒等映射
-        # 这是 Neural ODE 的常见技巧，有助于训练稳定性
+        # 关键修复：使用极小的高斯初始化而不是全零
+        # 全零会导致 res_blocks 在初期梯度为0（梯度阻断）
+        # 极小值 (1e-5) 既能保证 ODE 初始接近恒等，又能打通梯度
         nn.init.zeros_(self.output_proj.weight)
+        # nn.init.normal_(self.output_proj.weight, std=1e-5)
         nn.init.zeros_(self.output_proj.bias)
     
     def set_visual_feature(self, z_v):
@@ -258,8 +266,10 @@ class PromptLearner(nn.Module):
         
         # =========================================================
         # ODE 动力学网络 f_θ (这是唯一的可学习部分!)
+        # 关键修复：ODE 网络必须使用 float32 以保证数值稳定性
+        # torchdiffeq 在 fp16 下会出现严重的数值问题
         # =========================================================
-        self.ode_func = ODEFunc(ctx_dim, visual_dim).type(dtype)
+        self.ode_func = ODEFunc(ctx_dim, visual_dim).float()  # 强制 float32
         
         # ODE 求解器参数
         self.ode_t = torch.tensor([0.0, 1.0])  # 时间范围 [0, T]，T=1
@@ -302,12 +312,9 @@ class PromptLearner(nn.Module):
             3. 拼接 prompt: [SOS, p(T), class_name, EOS]
         """
         # =========================================================
-        # Step 1: 设置视觉特征条件
+        # Step 1: 获取 batch size
         # =========================================================
-        # z_v 形状: (batch_size, visual_dim)
-        # ODE 网络不再取平均，而是保留每个样本的特征
         bs = z_v.shape[0]
-        self.ode_func.set_visual_feature(z_v)
         
         # =========================================================
         # Step 2: ODE 求解 - 核心步骤!
@@ -324,22 +331,31 @@ class PromptLearner(nn.Module):
         # 
         # odeint 返回形状: (len(t), batch_size, n_ctx, prompt_dim)
         # 我们取 [1] 即 t=1 时刻的状态
-        p_trajectory = odeint(
+        # 关键修复：将输入转换为 float32 以匹配 ODE 网络
+        # ODE 求解过程在 float32 下进行，之后再转回原始 dtype
+        p0_float = p0.float()
+        z_v_float = z_v.float()
+        self.ode_func.set_visual_feature(z_v_float)  # 重新设置为 float32 版本
+        
+        # 使用普通 odeint 而非 adjoint 版本
+        # adjoint 在反向传播时需要重新求解 ODE，数值上更不稳定
+        # 普通 odeint 直接通过计算图反向传播，更稳定
+        p_trajectory = odeint_adjoint(
             self.ode_func,      # 导数函数 dp/dt = f_θ(p, z_v)
-            p0,                 # 初始状态 p(0)
+            p0_float,           # 初始状态 p(0)，float32
             t,                  # 时间点 [0, 1]
             method='dopri5',    # Dormand-Prince 5 (自适应步长)
-            rtol=1e-5,          # 放宽误差容限以避免 underflow
-            atol=1e-5,          
-            adjoint_method='dopri5',        
-            adjoint_rtol=1e-5,
-            adjoint_atol=1e-5,
-            options={'min_step': 5e-6} # 强制设置最小步长，防止 underflow
+            rtol=1e-3,          # 放宽容差以提高数值稳定性
+            atol=1e-4,          
+            options={'min_step': 1e-5}  # 适当的最小步长
         )
         
         # 取终端状态 p(T)
         # 形状: (batch_size, n_ctx, prompt_dim)
         ctx = p_trajectory[1]  # t=1 时刻的状态
+        
+        # 关键修复：将 ODE 输出转回原始 dtype (与 prefix/suffix 匹配)
+        ctx = ctx.type(self.p0.dtype)
         
         # =========================================================
         # Step 3: 扩展到所有类别
@@ -621,6 +637,19 @@ class AdvPT(TrainerX):
         loss_adv = torch.nn.CrossEntropyLoss()(output, label)
         loss = loss_adv
         self.model_backward_and_update(loss)
+                
+        # # 手动实现 backward + 梯度裁剪 + update，防止梯度爆炸
+        # self.model_zero_grad()
+        # loss.backward()
+        
+        # # 梯度裁剪：防止 ODE 网络梯度爆炸导致 NaN
+        # model = self.model.module if hasattr(self.model, 'module') else self.model
+        # torch.nn.utils.clip_grad_norm_(
+        #     model.prompt_learner.ode_func.parameters(), 
+        #     max_norm=1.0
+        # )
+        
+        # self.model_update()
 
         loss_summary = {
             "loss": loss.item(),
@@ -628,7 +657,8 @@ class AdvPT(TrainerX):
         }
 
         if (self.batch_idx + 1) == self.num_batches:
-            self.update_lr()
+            if self.cfg.OPTIM.LR_SCHEDULER != "plateau":
+                self.update_lr()
 
         return loss_summary
 
@@ -655,7 +685,8 @@ class AdvPT(TrainerX):
         }
 
         if (self.batch_idx + 1) == self.num_batches:
-            self.update_lr()
+            if self.cfg.OPTIM.LR_SCHEDULER != "plateau":
+                self.update_lr()
 
         return loss_summary
 
@@ -669,15 +700,11 @@ class AdvPT(TrainerX):
 
     def after_epoch(self):
         """
-        每个epoch结束后进行快速测试（干净样本 + 对抗样本）
+        每个 epoch 结束后进行验证（仅使用对抗数据）
         
-        这个方法会：
-        1. 测试当前训练模型的干净样本准确率（仅测试部分数据）
-        2. 测试对抗样本鲁棒性（如果已准备，仅测试部分数据）
-        3. 保存最佳模型
-        4. 记录训练进度到TensorBoard
-        
-        注意：为了节省时间，每个epoch只测试部分数据集
+        显示：
+        1. 训练集对抗准确率
+        2. 验证集对抗准确率
         """
         last_epoch = (self.epoch + 1) == self.max_epoch
         do_test = not self.cfg.TEST.NO_TEST
@@ -685,84 +712,94 @@ class AdvPT(TrainerX):
         if not do_test:
             return
         
-        print(f"\n{'='*80}")
-        print(f"Epoch {self.epoch + 1}/{self.max_epoch} - Quick Testing (Partial Dataset)")
-        print(f"{'='*80}")
+        print(f"\n{'='*60}")
+        print(f"Epoch {self.epoch + 1}/{self.max_epoch} - Adversarial Validation")
+        print(f"{'='*60}")
         
-        # 验证模型状态：打印 ODE 网络的一些权重统计信息
-        try:
-            if hasattr(self.model, 'module'):  # DataParallel 包装的情况
-                ode_func = self.model.module.prompt_learner.ode_func
-            else:
-                ode_func = self.model.prompt_learner.ode_func
-            
-            input_proj_sum = ode_func.input_proj.weight.sum().item()
-            output_proj_sum = ode_func.output_proj.weight.sum().item()
-            print(f"[Model State Verification]")
-            print(f"  ODE input_proj weight sum:  {input_proj_sum:.6f}")
-            print(f"  ODE output_proj weight sum: {output_proj_sum:.6f}")
-        except Exception as e:
-            print(f"[Warning] Could not verify model state: {e}")
+        # 获取每个 epoch 测试的 batch 数量
+        max_batches = getattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES', 2)
         
-        # 获取每个epoch测试的batch数量（可配置）
-        max_batches = self.cfg.TEST.EPOCH_TEST_BATCHES if hasattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES') else 20
-        
-        # 1. 干净样本测试（仅测试部分数据）
-        if max_batches > 0:
-            print(f'\n[1/2] Clean Sample Accuracy (Partial):')
-            clean_acc = self.test_partial(split="test", max_batches=max_batches)
-            print(f"      Result: {clean_acc:.2f}% (tested ~{max_batches * self.cfg.DATALOADER.TEST.BATCH_SIZE} samples)")
-        else:
-            # 如果设置为-1，则测试完整数据集
-            print(f'\n[1/2] Clean Sample Accuracy (Full Dataset):')
-            clean_acc = self.test(split="test")
-            print(f"      Result: {clean_acc:.2f}%")
-        
-        # 2. 对抗样本测试（如果已经准备好，仅测试部分数据）
-        robust_acc = None
-        if hasattr(self, 'test_pkl') and self.test_pkl is not None:
-            if max_batches > 0:
-                print(f'\n[2/2] Adversarial Robustness (PGD, Partial):')
-                robust_acc = self.test_adv_partial(split="test", max_batches=max_batches)
-                print(f"      Result: {robust_acc:.2f}% (tested ~{max_batches * self.cfg.DATALOADER.TEST.BATCH_SIZE} samples)")
-            else:
-                # 如果设置为-1，则测试完整数据集
-                print(f'\n[2/2] Adversarial Robustness (PGD, Full Dataset):')
-                robust_acc = self.test_adv(split="test")
-                print(f"      Result: {robust_acc:.2f}%")
-        else:
-            print(f'\n[2/2] Adversarial test skipped (test_pkl not prepared)')
-        
-        # 记录到TensorBoard
-        self.write_scalar("epoch/clean_acc", clean_acc, self.epoch)
-        if robust_acc is not None:
-            self.write_scalar("epoch/robust_acc", robust_acc, self.epoch)
-            # 计算准确率差距（用于监控过拟合）
-            acc_gap = clean_acc - robust_acc
-            self.write_scalar("epoch/acc_gap", acc_gap, self.epoch)
-        
-        # 保存最佳模型（基于干净样本准确率）
-        is_best = clean_acc > self.best_result
-        if is_best:
-            self.best_result = clean_acc
-            self.save_model(
-                self.epoch,
-                self.output_dir,
-                val_result=clean_acc,
-                is_best=True
+        # 1. 训练集对抗准确率
+        train_acc = None
+        if hasattr(self, 'train_pkl') and self.train_pkl is not None:
+            print(f'\n[1/2] Train Adversarial Accuracy:')
+            train_acc = self._eval_adv_embedding(
+                self.train_pkl,
+                self.train_loader_x_noshuffle,
+                max_batches=max_batches
             )
-            print(f"\n{'*'*80}")
-            print(f"*** NEW BEST MODEL SAVED ***")
-            print(f"    Epoch: {self.epoch + 1}/{self.max_epoch}")
-            print(f"    Clean Acc: {clean_acc:.2f}%")
-            if robust_acc is not None:
-                print(f"    Robust Acc: {robust_acc:.2f}%")
-                print(f"    Gap: {acc_gap:.2f}%")
-            print(f"{'*'*80}")
+            print(f"      Train Adv Acc: {train_acc:.2f}%")
         else:
-            print(f"\n[Best Model Status]")
-            print(f"    Current Clean Acc: {clean_acc:.2f}%")
-            print(f"    Best Clean Acc: {self.best_result:.2f}%")
+            print(f'\n[1/2] Train adversarial test skipped (train_pkl not prepared)')
+        
+        # 2. 验证集对抗准确率
+        val_acc = None
+        val_loss = None
+        if hasattr(self, 'val_pkl') and self.val_pkl is not None:
+            print(f'\n[2/2] Validation Adversarial Accuracy:')
+            val_acc = self._eval_adv_embedding(
+                self.val_pkl,
+                self.val_loader,
+                max_batches=max_batches
+            )
+            print(f"      Val Adv Acc: {val_acc:.2f}%")
+            if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
+                val_loss = self._eval_adv_embedding_loss(
+                    self.val_pkl,
+                    self.val_loader,
+                    max_batches=max_batches
+                )
+        elif hasattr(self, 'test_pkl') and self.test_pkl is not None:
+            # 如果没有验证集对抗嵌入，使用测试集
+            print(f'\n[2/2] Test Adversarial Accuracy (no val_pkl):')
+            val_acc = self.test_adv_partial(split="test", max_batches=max_batches)
+            print(f"      Test Adv Acc: {val_acc:.2f}%")
+            if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
+                val_loss = self._eval_adv_embedding_loss(
+                    self.test_pkl,
+                    self.test_loader,
+                    max_batches=max_batches
+                )
+        else:
+            print(f'\n[2/2] Validation adversarial test skipped')
+        
+        # 打印摘要
+        summary_parts = []
+        if train_acc is not None:
+            summary_parts.append(f"Train: {train_acc:.2f}%")
+        if val_acc is not None:
+            summary_parts.append(f"Val: {val_acc:.2f}%")
+        if summary_parts:
+            print(f"\n[Summary] {' | '.join(summary_parts)}")
+        
+        # 记录到 TensorBoard
+        if train_acc is not None:
+            self.write_scalar("epoch/train_adv_acc", train_acc, self.epoch)
+        if val_acc is not None:
+            self.write_scalar("epoch/val_adv_acc", val_acc, self.epoch)
+        if val_loss is not None:
+            self.write_scalar("epoch/val_adv_loss", val_loss, self.epoch)
+
+        # 使用验证集损失驱动学习率调整（ReduceLROnPlateau）
+        if self.cfg.OPTIM.LR_SCHEDULER == "plateau" and val_loss is not None:
+            self.sched.step(val_loss)
+        
+        # 保存最佳模型（基于验证集对抗准确率）
+        if val_acc is not None:
+            is_best = val_acc > self.best_result
+            if is_best:
+                self.best_result = val_acc
+                self.save_model(
+                    self.epoch,
+                    self.output_dir,
+                    val_result=val_acc,
+                    is_best=True
+                )
+                print(f"\n{'*'*60}")
+                print(f"*** NEW BEST MODEL SAVED ***")
+                print(f"    Epoch: {self.epoch + 1}")
+                print(f"    Val Adv Acc: {val_acc:.2f}%")
+                print(f"{'*'*60}")
         
         # 定期保存检查点
         meet_checkpoint_freq = (
@@ -773,16 +810,88 @@ class AdvPT(TrainerX):
             self.save_model(self.epoch, self.output_dir)
             print(f"[Checkpoint Saved] Epoch {self.epoch + 1}")
         
-        print(f"{'='*80}\n")
+        print(f"{'='*60}\n")
 
     @torch.no_grad()
-    def test_partial(self, split=None, max_batches=20):
+    def _eval_adv_embedding(self, embedding_pkl, data_loader, max_batches=None):
         """
-        部分数据集测试（干净样本）- 用于每个epoch的快速评估
+        使用预计算的对抗嵌入评估模型
+        
+        参数:
+            embedding_pkl: 对抗嵌入张量
+            data_loader: 对应的数据加载器（用于获取标签）
+            max_batches: 最多评估的 batch 数量
+        
+        返回:
+            准确率 (%)
+        """
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+        
+        # 获取实际模型（处理 DataParallel 包装）
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        for batch_idx, batch in enumerate(data_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+            
+            label = batch["label"].to(self.device)
+            
+            # 获取对应的对抗嵌入
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + label.shape[0]
+            embedding_adv = embedding_pkl[start_idx:end_idx].to(self.device)
+            
+            # 使用对抗嵌入进行推理
+            output = model.forward_embedding(embedding_adv)
+            self.evaluator.process(output, label)
+        
+        results = self.evaluator.evaluate()
+        return list(results.values())[0]
+
+    @torch.no_grad()
+    def _eval_adv_embedding_loss(self, embedding_pkl, data_loader, max_batches=None):
+        """
+        使用预计算的对抗嵌入评估验证集损失
+
+        返回:
+            平均交叉熵损失
+        """
+        self.set_model_mode("eval")
+
+        # 获取实际模型（处理 DataParallel 包装）
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        total_loss = 0.0
+        total_count = 0
+
+        for batch_idx, batch in enumerate(data_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+
+            label = batch["label"].to(self.device)
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + label.shape[0]
+            embedding_adv = embedding_pkl[start_idx:end_idx].to(self.device)
+
+            output = model.forward_embedding(embedding_adv)
+            loss = F.cross_entropy(output, label, reduction="sum")
+            total_loss += loss.item()
+            total_count += label.shape[0]
+
+        if total_count == 0:
+            return None
+
+        return total_loss / total_count
+
+    @torch.no_grad()
+    def _test_impl(self, split=None, max_batches=None, use_adv=False):
+        """
+        统一的测试实现
         
         参数:
             split: 数据集划分 ('test' or 'val')
-            max_batches: 最多测试的batch数量
+            max_batches: 最多测试的 batch 数量（None 表示测试全部）
+            use_adv: 是否使用对抗样本
         
         返回:
             准确率 (%)
@@ -799,78 +908,52 @@ class AdvPT(TrainerX):
             split = "test"
             data_loader = self.test_loader
 
-        print(f"Evaluate on the *{split}* set (first {max_batches} batches)")
+        # 初始化归一化器（仅对抗测试时需要）
+        if use_adv:
+            if not hasattr(self, 'normalizer'):
+                self.normalizer = ImageNormalizer(device=self.device)
+            else:
+                self.normalizer.to(self.device)
+            test_eps = self.cfg.DATASET.TEST_EPS / 255.0
+            array_to_pkl = self.test_pkl
+
+        # 打印测试信息
+        batch_info = f"first {max_batches} batches" if max_batches else "all"
+        adv_info = "adversarial" if use_adv else "clean"
+        print(f"Evaluate {adv_info} on the *{split}* set ({batch_info})")
 
         for batch_idx, batch in enumerate(data_loader):
-            if batch_idx >= max_batches:
+            if max_batches and batch_idx >= max_batches:
                 break
+            
             input, label = self.parse_batch_test(batch)
-            output = self.model_inference(input)
+            
+            if use_adv:
+                # 获取对应的对抗样本
+                start_idx = batch_idx * data_loader.batch_size
+                end_idx = start_idx + input.shape[0]
+                input_adv = array_to_pkl[start_idx:end_idx].to(input.device)
+                
+                # 使用 normalizer 限制扰动
+                input_to_eval = self.normalizer.clamp_perturbation(input_adv, input, test_eps)
+            else:
+                input_to_eval = input
+            
+            output = self.model_inference(input_to_eval)
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()
         return list(results.values())[0]
 
     @torch.no_grad()
+    def test_partial(self, split=None, max_batches=20):
+        """部分数据集测试（干净样本）"""
+        return self._test_impl(split, max_batches=max_batches, use_adv=False)
+
+    @torch.no_grad()
     def test_adv_partial(self, split=None, max_batches=20):
-        """
-        部分数据集对抗测试 - 用于每个epoch的快速评估
-        
-        参数:
-            split: 数据集划分 ('test' or 'val')
-            max_batches: 最多测试的batch数量
-        
-        返回:
-            鲁棒准确率 (%)
-        """
-        self.set_model_mode("eval")
-        self.evaluator.reset()
-
-        if split is None:
-            split = self.cfg.TEST.SPLIT
-
-        if split == "val" and self.val_loader is not None:
-            data_loader = self.val_loader
-        else:
-            split = "test"
-            data_loader = self.test_loader
-
-        array_to_pkl = self.test_pkl
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1).to(self.device)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1).to(self.device)
-
-        print(f"Evaluate on the *{split}* set (first {max_batches} batches)")
-
-        for batch_idx, batch in enumerate(data_loader):
-            if batch_idx >= max_batches:
-                break
-            input, label = self.parse_batch_test(batch)
-            # 获取对应的对抗样本
-            input_adv = array_to_pkl[batch_idx * data_loader.batch_size: (batch_idx + 1) * data_loader.batch_size]
-            input_adv = input_adv.to(input.device)
-
-            # 限制噪声幅度
-            test_eps = self.cfg.DATASET.TEST_EPS / 255.0
-            x_adv = input_adv*std + mean
-            x = input*std + mean
-            noise = x_adv-x
-            noise = torch.clamp(noise, -test_eps, test_eps)
-            x_adv = x+noise
-            x_adv = torch.clamp(x_adv, 0, 1)
-            
-            # 验证约束
-            assert (torch.max(x_adv - x) < (test_eps + 1e-6))
-            assert (torch.min(x_adv - x) > (-test_eps - 1e-6))
-            
-            # 重新归一化
-            input_adv = (x_adv-mean)/std
-
-            # 模型推理
-            output = self.model_inference(input_adv)
-            self.evaluator.process(output, label.to(input.device))
-
-        results = self.evaluator.evaluate()
-        return list(results.values())[0]
+        """部分数据集对抗测试"""
+        return self._test_impl(split, max_batches=max_batches, use_adv=True)
 
     def load_model(self, directory, epoch=None, model_file=None):
         """

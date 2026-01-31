@@ -171,6 +171,11 @@ _C.OPTIM.LR_SCHEDULER = "single_step"
 # -1 or 0 means the stepsize is equal to max_epoch
 _C.OPTIM.STEPSIZE = (-1, )
 _C.OPTIM.GAMMA = 0.1
+_C.OPTIM.PLATEAU_MODE = "min"
+_C.OPTIM.PLATEAU_FACTOR = 0.1
+_C.OPTIM.PLATEAU_PATIENCE = 5
+_C.OPTIM.PLATEAU_THRESHOLD = 1e-4
+_C.OPTIM.PLATEAU_MIN_LR = 1e-6
 _C.OPTIM.MAX_EPOCH = 10
 # Set WARMUP_EPOCH larger than 0 to activate warmup training
 _C.OPTIM.WARMUP_EPOCH = -1
@@ -216,7 +221,7 @@ _C.TEST.SPLIT = "test"
 _C.TEST.FINAL_MODEL = "last_step"
 # Number of batches to test per epoch (for quick evaluation)
 # Set to -1 to test the entire dataset
-_C.TEST.EPOCH_TEST_BATCHES = 20
+_C.TEST.EPOCH_TEST_BATCHES = 2
 
 ###########################
 # Trainer specifics

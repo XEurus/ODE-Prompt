@@ -223,42 +223,20 @@ def setup_cfg(args):
 
 
 def main(args):
-    """
-    主函数 - 协调训练和评估流程
-    
-    流程：
-    1. 设置配置和随机种子
-    2. 构建训练器
-    3. 根据模式执行：
-       - 白盒评估：加载模型 -> 干净测试 -> 对抗测试
-       - 黑盒评估：加载模型 -> 干净测试 -> 黑盒对抗测试
-       - 训练：训练模型 -> 干净测试 -> 对抗测试
-    
-    参数：
-        args: 命令行参数对象
-    """
+    """主函数 - 协调训练和评估流程"""
     cfg = setup_cfg(args)
     
-    # 设置随机种子以保证可复现性
+    # 设置随机种子
     if cfg.SEED >= 0:
         print("Setting fixed seed: {}".format(cfg.SEED))
         set_random_seed(cfg.SEED)
     
-    # 设置日志记录器
     setup_logger(cfg.OUTPUT_DIR)
 
-    # 启用 cuDNN benchmark 加速卷积运算
     if torch.cuda.is_available() and cfg.USE_CUDA:
         torch.backends.cudnn.benchmark = True
 
-
-    # 创建 pkl 数据保存目录（用于存储对抗样本嵌入）
-    # pkl 是 Python 的 pickle 序列化格式，用于将对象持久化到磁盘
-    # 这里主要存储：
-    # 1. 对抗样本的图像嵌入（image embeddings）
-    # 2. 文本嵌入（text embeddings）
-    # 3. 对抗扰动的中间结果
-    # 好处：避免重复计算嵌入，加速对抗攻击评估
+    # 创建 pkl 数据保存目录
     if not os.path.exists(args.path):
         os.makedirs(args.path)
     
@@ -273,91 +251,76 @@ def main(args):
     # ========================================================================
     # 白盒攻击评估模式
     # ========================================================================
-    # print('---------------------------------------------------')
+    # print('-' * 60)
     # print('adaptive attack acc:')
     # trainer.test_adaptive_attack()
-    # print('---------------------------------------------------')
+    # print('-' * 60)
     if args.eval_only:
         # 加载预训练模型
         args.eval_only = True
         trainer.load_model(args.model_dir, epoch=args.load_epoch, model_file=args.model_file)
-        print(args.model_dir)
-        print('---------------------------------------------------')
+        print(f"Model loaded from: {args.model_dir}")
+        print('-' * 60)
         
-        # 1. 干净样本准确率测试
-        print('clean acc:')
+        print('Clean accuracy:')
         trainer.test()
-        print('---------------------------------------------------')
+        print('-' * 60)
         
-        # 2. 白盒对抗攻击测试（如 PGD）
-        print('robust acc(PGD):')
+        print(f'Robust accuracy ({args.white_attack}):')
         trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
-        # 3. 自适应攻击测试
-        print('---------------------------------------------------')
-        print('adaptive attack acc:')
-        trainer.test_adaptive_attack()
-        print('---------------------------------------------------')
-        return
+        print('-' * 60)
+        
+        # print('Adaptive attack accuracy:')
+        # trainer.test_adaptive_attack()
+        # print('-' * 60)
+        # return
 
-    # ========================================================================
-    # 黑盒攻击评估模式
-    # ========================================================================
-    elif args.eval_black:
-        # 加载预训练模型
+    # ========== 黑盒攻击评估模式 ==========
+    if args.eval_black:
         trainer.load_model(args.model_dir, epoch=args.load_epoch, model_file=args.model_file)
-        print(args.model_dir)
-        print('---------------------------------------------------')
+        print(f"Model loaded from: {args.model_dir}")
+        print('-' * 60)
         
-        # 1. 干净样本准确率测试
-        print('clean acc:')
+        print('Clean accuracy:')
         trainer.test()
-        print('---------------------------------------------------')
+        print('-' * 60)
         
-        # 2. 黑盒对抗攻击测试（如 RAP、SIA）
-        print('robust acc(RAP):')
+        print(f'Black-box robust accuracy ({args.black_attack}):')
         trainer.before_black_test(args.path, args.black_attack)
         trainer.test_adv()
-        print('---------------------------------------------------')
+        print('-' * 60)
 
-        print('robust acc(PGD):')
+        print(f'White-box robust accuracy ({args.white_attack}):')
         trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
-        print('---------------------------------------------------')
+        print('-' * 60)
 
-        print('adaptive attack acc:')
+        print('Adaptive attack accuracy:')
         trainer.test_adaptive_attack()
-        print('---------------------------------------------------')
+        print('-' * 60)
         return
 
-    # ========================================================================
-    # 训练模式
-    # ========================================================================
-    if not args.no_train:
+    # ========== 训练模式 ==========
+    elif not args.no_train:
         if args.adv_training:
-            # =========================================================
-            # 准备对抗训练所需的数据
-            # =========================================================
-            print('='*80)
+            print('=' * 60)
             print('Preparing adversarial training data...')
-            print('='*80)
+            print('=' * 60)
             
-            # 1. 准备训练集的对抗样本特征（用于训练）
-            print('\n[1/2] Generating/Loading training adversarial features...')
+            print('\n[1/3] Generating/Loading training adversarial embeddings...')
             trainer.before_adv_train(path=args.path, attack='PGD')
-            print('Training adversarial features ready.')
             
-            # 2. 准备测试集的对抗样本（用于每个epoch的测试）
-            print('\n[2/2] Generating/Loading test adversarial samples...')
+            print('\n[2/3] Generating/Loading validation adversarial embeddings...')
+            trainer.before_adv_val(path=args.path, attack='PGD')
+            
+            print('\n[3/3] Generating/Loading test adversarial samples...')
             trainer.before_adv_test(path=args.path, attack='PGD')
-            print('Test adversarial samples ready.')
             
-            print('='*80)
-            print('Starting adversarial training with epoch-wise testing...')
-            print('='*80 + '\n')
+            print('=' * 60)
+            print('Starting adversarial training...')
+            print('=' * 60 + '\n')
             
-            # 对抗训练模式：使用对抗样本进行训练
-            # 注意：每个epoch结束后会自动调用 after_epoch() 进行测试
             trainer.train(path=args.path, adv_training=True)
         else:
             raise "error"
@@ -365,23 +328,23 @@ def main(args):
             trainer.train()
         
         # 训练完成后进行评估
-        print('---------------------------------------------------')
-        print('clean acc:')
+        print('-' * 60)
+        print('Clean accuracy:')
         trainer.test()
-        print('---------------------------------------------------')
+        print('-' * 60)
         # print('robust acc(RAP):')
         # trainer.before_black_test(args.path, args.black_attack)
         # trainer.test_adv()
-        # print('---------------------------------------------------')
+        # print('-' * 60)
 
         print('robust acc(PGD):')
         #trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
-        print('---------------------------------------------------')
+        print('-' * 60)
 
         # print('adaptive attack acc:')
         # trainer.test_adaptive_attack()
-        # print('---------------------------------------------------')
+        # print('-' * 60)
         return
 
 

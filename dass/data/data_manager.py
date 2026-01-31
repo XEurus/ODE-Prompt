@@ -149,6 +149,7 @@ class DataManager:
         if dataset.val:
             val_loader = build_data_loader(
                 cfg,
+                adv=adv,  # 传递 adv 参数
                 sampler_type=cfg.DATALOADER.TEST.SAMPLER,
                 data_source=dataset.val,
                 batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
@@ -158,8 +159,10 @@ class DataManager:
             )
 
         # Build test_loader
+        # 如果是 notransform 模式，测试集也不使用归一化
         test_loader = build_data_loader(
             cfg,
+            adv=adv if adv == 'notransform_noshuffle' else None,
             sampler_type=cfg.DATALOADER.TEST.SAMPLER,
             data_source=dataset.test,
             batch_size=batch_size,

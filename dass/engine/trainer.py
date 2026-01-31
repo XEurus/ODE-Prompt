@@ -19,22 +19,13 @@ from dass.utils import (
 )
 from dass.modeling import build_head, build_backbone
 from dass.evaluation import build_evaluator
-from attack.attackFeature import PGD
 from attack.purification import super_resolution
+from utils.adv_utils import (
+    ImageNormalizer, ClipModel, get_model, create_pgd_attacker
+)
 import clip
 from torch import randperm
 import os
-
-
-def get_model(model):
-    """
-    获取实际的模型对象。
-    如果是DataParallel或DistributedDataParallel包装的模型，则返回model.module。
-    """
-    if hasattr(model, 'module'):
-        return model.module
-    else:
-        return model
 
 
 class SimpleNet(nn.Module):
@@ -321,9 +312,9 @@ class TrainerBase:
         self.max_epoch = max_epoch
         print("adv_training: ", adv_training)
         # self.before_train() # 注意：before_train通常在调用此方法前手动调用或在子类中处理
-        if adv_training:
-            # 如果是对抗训练，进行预处理（例如生成对抗样本）
-            self.before_adv_train(path=path)
+        # if adv_training:
+        #     # 如果是对抗训练，进行预处理（例如生成对抗样本）
+        #     self.before_adv_train(path=path)
         for self.epoch in range(self.start_epoch, self.max_epoch):
             self.before_epoch() # 每个epoch前的钩子
             if adv_training:
@@ -392,29 +383,6 @@ class TrainerBase:
         self.model_update(names)
 
 
-class ClipModel(torch.nn.Module):
-    """
-    CLIP模型的包装器，用于对抗攻击或特征提取。
-    """
-    def __init__(self, model, num_classes=1000):
-        super(ClipModel, self).__init__()
-        self.model = model
-
-        # temp, self.preprocess_val = clip.load(self.name, 'cpu')
-        self.visual_encoder = self.model
-
-        output_dim = self.visual_encoder.output_dim
-        # 添加一个全连接层用于攻击embedding (对抗性微调或Prompt Tuning场景)
-        self.fc = torch.nn.Linear(output_dim, 2)
-
-    def forward(self, image):
-        # 通过视觉编码器提取特征
-        x = self.visual_encoder(image)
-        # 通过全连接层（通常用于辅助攻击目标的映射）
-        x = self.fc(x)
-        return x
-
-
 class SimpleTrainer(TrainerBase):
     """
     实现通用功能的简单训练器类。
@@ -448,34 +416,33 @@ class SimpleTrainer(TrainerBase):
         pass
 
     def build_data_loader(self):
-        """
-        创建必要的数据相关属性。
-        """
+        """创建必要的数据相关属性。"""
         batch_size = self.cfg.DATALOADER.TRAIN_X.BATCH_SIZE
-        # 使用DataManager管理数据加载
         dm = DataManager(self.cfg, batch_size)
 
-        self.train_loader_x = dm.train_loader_x # 标记训练数据加载器
-        self.train_loader_u = dm.train_loader_u  # 可选，无标签数据加载器
-        self.val_loader = dm.val_loader  # 可选，验证集加载器
-        self.test_loader = dm.test_loader # 测试集加载器
+        self.train_loader_x = dm.train_loader_x
+        self.train_loader_u = dm.train_loader_u
+        self.val_loader = dm.val_loader
+        self.test_loader = dm.test_loader
 
-        # 可选：为对抗训练构建特定的数据加载器
-        self.adv = 'notransform_noshuffle'
-        batch_size = self.cfg.DATALOADER.TRAIN_X.BATCH_SIZE
-        # 不使用变换且不打乱的数据管理器
-        dm = DataManager(self.cfg, batch_size, self.adv)
-        self.train_loader_x_notransform_noshuffle = dm.train_loader_x
+        # 不带归一化的训练 DataLoader（用于对抗攻击）
+        dm_notransform = DataManager(self.cfg, batch_size, adv='notransform_noshuffle')
+        self.train_loader_x_notransform_noshuffle = dm_notransform.train_loader_x
+        self.val_loader_notransform = dm_notransform.val_loader  # 验证集也使用 notransform
 
-        self.adv = 'noshuffle'
-        batch_size = self.cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE
-        # 仅不打乱的数据管理器，用于生成Embedding
-        dm = DataManager(self.cfg, batch_size, self.adv)
-        self.train_loader_x_noshuffle = dm.train_loader_x
+        # 带归一化但不打乱的训练 DataLoader（用于生成 Embedding）
+        batch_size_emb = self.cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE
+        dm_noshuffle = DataManager(self.cfg, batch_size_emb, adv='noshuffle')
+        self.train_loader_x_noshuffle = dm_noshuffle.train_loader_x
+
+        # 不带归一化的测试 DataLoader（用于对抗攻击）
+        test_batch_size = self.cfg.DATALOADER.TEST.BATCH_SIZE
+        dm_test_notransform = DataManager(self.cfg, test_batch_size, adv='notransform_noshuffle')
+        self.test_loader_notransform = dm_test_notransform.test_loader
 
         self.num_classes = dm.num_classes
         self.num_source_domains = dm.num_source_domains
-        self.lab2cname = dm.lab2cname  # dict {label: classname}
+        self.lab2cname = dm.lab2cname
 
         self.dm = dm
 
@@ -534,93 +501,75 @@ class SimpleTrainer(TrainerBase):
         """
         对抗训练前的准备：生成或加载对抗样本特征。
         
-        重要修复 (2026-01-26):
-        - 使用 self.model.image_encoder 而不是新加载的 CLIP 模型
-        - 确保与测试时使用完全相同的模型和预处理
-        - 使用带归一化的数据加载器 (train_loader_x_noshuffle 而不是 notransform)
+        流程（无来回归一化）：
+        1. 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
+        2. PGD 攻击（攻击器内部归一化后传给网络）
+        3. 攻击结果归一化后提取特征
         """
-        # 定义保存对抗特征的pkl文件路径 - 添加 _v2 后缀标识新版本
-        pkl_path = '{}/{}_{}_v2.pkl'.format(path, self.cfg.DATASET.NAME, self.cfg.MODEL.BACKBONE.NAME.replace(
-                                                                         "/",
-                                                                         "_"))
-        # 如果文件存在，直接加载
+        pkl_path = '{}/{}_{}_v2.pkl'.format(
+            path, self.cfg.DATASET.NAME, 
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+        )
+        
         if os.path.isfile(pkl_path):
             self.train_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
             print(f'[before_adv_train] Loaded train_pkl from {pkl_path}')
             return
         
         print("[before_adv_train] Generating adversarial embeddings...")
-        print("[before_adv_train] Using self.model.image_encoder for consistency with testing")
         
-        # 否则开始生成对抗样本特征
+        # 统一的归一化器（攻击器内部和外部使用相同参数）
+        normalizer = ImageNormalizer(device=self.device)
         train_eps = self.cfg.DATASET.TRAIN_EPS
-        # CLIP模型的归一化参数
-        mean_val = [0.48145466, 0.4578275, 0.40821073]
-        std_val = [0.26862954, 0.26130258, 0.27577711]
-        normalize = transforms.Normalize(mean_val, std_val)
-        mean = torch.tensor(mean_val).view(-1, 1, 1).to(self.device)
-        std = torch.tensor(std_val).view(-1, 1, 1).to(self.device)
         
-        # 【关键修复】使用 self.model 的 image_encoder 而不是新加载的模型
-        # 这确保训练和测试使用完全相同的模型
-        model = self.model.module if hasattr(self.model, 'module') else self.model
+        # 获取模型组件
+        model = get_model(self.model)
         image_encoder = model.image_encoder
         dtype = model.dtype
         
-        # 构建代理模型用于生成攻击（仍然使用独立的 ClipModel）
-        # 注意：这里仍然用新加载的模型做攻击，但提取特征用 self.model
+        # 构建代理模型
         clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
         if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
-            clip_model.float()
+            raise NotImplementedError("fp32/amp not supported for surrogate model")
         surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
 
         if attack == 'PGD':
-            # 初始化PGD攻击器（使用统一的迭代次数配置）
-            num_iters = self.cfg.DATASET.PGD_NUM_ITERS if hasattr(self.cfg.DATASET, 'PGD_NUM_ITERS') else 40
-            attacker = PGD(train_eps / 255., preprocess=normalize, num_iters=num_iters)
-            print(f"[before_adv_train] Using PGD attack with eps={train_eps}/255, iters={num_iters}")
+            # 攻击器使用相同的 normalizer，内部会归一化后传给网络
+            attacker = create_pgd_attacker(train_eps, normalizer, self.cfg)
+            print(f"[before_adv_train] Using PGD attack with eps={train_eps}/255")
         else:
-            attacker = None
+            raise ValueError(f"Unknown attack type: {attack}")
 
-        # 获取 embedding 维度
         embedding_dim = image_encoder.output_dim
         print(f"[before_adv_train] Embedding dimension: {embedding_dim}")
         
-        # 【关键修复】使用 train_loader_x_noshuffle（带标准预处理）而不是 notransform_noshuffle
-        # 这确保与测试时的预处理完全一致
-        data_loader = self.train_loader_x_noshuffle
-        
-        # 初始化存储特征的张量
+        # 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
+        data_loader = self.train_loader_x_notransform_noshuffle
         self.train_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
         
         # 确保 image_encoder 在 eval 模式
         image_encoder.eval()
         
-        # 遍历数据集生成对抗样本并提取特征
         print(f"[before_adv_train] Processing {len(data_loader)} batches...")
         for batch_idx, batch in enumerate(data_loader):
-            # 图像已经是归一化后的
-            inputs_normalized = batch['img'].to(self.device)
+            # 直接是 [0,1] 像素空间图像，无需反归一化
+            inputs_pixel = batch['img'].to(self.device)
             
-            # 还原到 [0, 1] 范围用于攻击
-            inputs = inputs_normalized * std + mean
-            inputs = torch.clamp(inputs, 0, 1)
+            # PGD 攻击（攻击器内部会归一化后传给网络）
+            # 返回的是像素空间的对抗样本
+            images_adv_pixel = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc')
             
-            # 生成对抗样本
-            images_adv = attacker.run(surrogate, inputs, scaler=1, feature_layer='fc')
+            # 验证扰动范围
+            eps_val = train_eps / 255.
+            assert torch.max(images_adv_pixel - inputs_pixel) < (eps_val + 1e-6)
+            assert torch.min(images_adv_pixel - inputs_pixel) > (-eps_val - 1e-6)
             
-            # 检查扰动范围
-            assert torch.max(images_adv - inputs) < (train_eps / 255. + 1e-6)
-            assert torch.min(images_adv - inputs) > (-train_eps / 255 - 1e-6)
+            # 归一化后提取特征
+            images_adv_normalized = normalizer.normalize(images_adv_pixel)
             
-            # 归一化对抗样本
-            images_adv_normalized = (images_adv - mean) / std
-            
-            # 【关键修复】使用 self.model.image_encoder 提取特征
             with torch.no_grad():
                 embedding = image_encoder(images_adv_normalized.type(dtype))
 
-            # 保存特征到tensor中
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + embedding.shape[0]
             self.train_pkl[start_idx:end_idx] = embedding.cpu().float()
@@ -628,85 +577,162 @@ class SimpleTrainer(TrainerBase):
             if (batch_idx + 1) % 10 == 0:
                 print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
 
-        # 保存生成的特征到文件
         torch.save(self.train_pkl, pkl_path)
         print(f'[before_adv_train] Generated and saved train_pkl to {pkl_path}')
+        del surrogate
+        torch.cuda.empty_cache()
+
+    def before_adv_val(self, path, attack='PGD'):
+        """
+        生成验证集的对抗嵌入（用于每个 epoch 的验证）
+        
+        流程与 before_adv_train 相同，但使用验证集数据
+        """
+        pkl_path = '{}/{}_{}_val_v2.pkl'.format(
+            path, self.cfg.DATASET.NAME, 
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+        )
+        
+        if os.path.isfile(pkl_path):
+            self.val_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
+            print(f'[before_adv_val] Loaded val_pkl from {pkl_path}')
+            return
+        
+        # 检查是否有验证集
+        if self.val_loader_notransform is None:
+            print("[before_adv_val] No validation set available, skipping...")
+            self.val_pkl = None
+            return
+        
+        print("[before_adv_val] Generating validation adversarial embeddings...")
+        
+        normalizer = ImageNormalizer(device=self.device)
+        val_eps = self.cfg.DATASET.TRAIN_EPS  # 使用与训练相同的扰动强度
+        
+        model = get_model(self.model)
+        image_encoder = model.image_encoder
+        dtype = model.dtype
+        
+        # 构建代理模型
+        clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
+        if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
+            raise NotImplementedError("fp32/amp not supported for surrogate model")
+        surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
+
+        if attack == 'PGD':
+            attacker = create_pgd_attacker(val_eps, normalizer, self.cfg)
+            print(f"[before_adv_val] Using PGD attack with eps={val_eps}/255")
+        else:
+            raise ValueError(f"Unknown attack type: {attack}")
+
+        embedding_dim = image_encoder.output_dim
+        data_loader = self.val_loader_notransform
+        self.val_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
+        
+        image_encoder.eval()
+        
+        print(f"[before_adv_val] Processing {len(data_loader)} batches...")
+        for batch_idx, batch in enumerate(data_loader):
+            inputs_pixel = batch['img'].to(self.device)
+            images_adv_pixel = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc')
+            
+            eps_val = val_eps / 255.
+            assert torch.max(images_adv_pixel - inputs_pixel) < (eps_val + 1e-6)
+            assert torch.min(images_adv_pixel - inputs_pixel) > (-eps_val - 1e-6)
+            
+            images_adv_normalized = normalizer.normalize(images_adv_pixel)
+            
+            with torch.no_grad():
+                embedding = image_encoder(images_adv_normalized.type(dtype))
+
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + embedding.shape[0]
+            self.val_pkl[start_idx:end_idx] = embedding.cpu().float()
+            
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
+
+        torch.save(self.val_pkl, pkl_path)
+        print(f'[before_adv_val] Generated and saved val_pkl to {pkl_path}')
         del surrogate
         torch.cuda.empty_cache()
 
     def before_adv_test(self, path, attack='PGD'):
         """
         对抗测试前的准备：生成测试集的对抗样本。
-        """
-        # 定义保存路径
-        pkl_path = '{}/{}_{}_{}.pkl'.format(path, self.cfg.DATASET.NAME, self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
-                                                                              attack)
-        mean_value, std_value = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
-        mean = torch.tensor(mean_value).view(-1, 1, 1).to(self.device)
-        std = torch.tensor(std_value).view(-1, 1, 1).to(self.device)
-        normalize = transforms.Normalize(mean_value, std_value)
-        self.mean, self.std = mean, std
         
-        # 如果存在，直接加载
+        流程（无来回归一化）：
+        1. 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
+        2. PGD 攻击（攻击器内部归一化后传给网络）
+        3. 攻击结果归一化后保存（供 test_adv 使用）
+        """
+        pkl_path = '{}/{}_{}_{}.pkl'.format(
+            path, self.cfg.DATASET.NAME, 
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"), attack
+        )
+        
+        # 初始化归一化器（保存为实例属性供 test_adv 使用）
+        self.normalizer = ImageNormalizer(device=self.device)
+        
         if os.path.isfile(pkl_path):
             self.test_pkl = torch.load(pkl_path, weights_only=False)
             return
         
-        # 初始化存储测试对抗样本的张量
-        self.test_pkl = torch.empty(size=[len(self.test_loader.dataset), 3, 224, 224])
+        # 使用不带归一化的测试 DataLoader
+        data_loader = self.test_loader_notransform
+        self.test_pkl = torch.empty(size=[len(data_loader.dataset), 3, 224, 224])
         test_eps = self.cfg.DATASET.TEST_EPS
 
         if attack == 'PGD':
-            # 加载模型和攻击器（使用统一的迭代次数配置）
             temp_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
-            
-            # 关键修复：确保精度与 CustomCLIP 一致
             if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
                 temp_model.float()
-                print("[before_adv_test] CLIP model converted to fp32 to match training precision")
-            else:
-                print("[before_adv_test] CLIP model using default fp16 precision")
+                print("[before_adv_test] CLIP model converted to fp32")
             
             surrogate = ClipModel(model=get_model(temp_model.visual), num_classes=2).eval().to(self.device)
-            num_iters = self.cfg.DATASET.PGD_NUM_ITERS if hasattr(self.cfg.DATASET, 'PGD_NUM_ITERS') else 40
-            attacker = PGD(test_eps / 255., preprocess=normalize, num_iters=num_iters)
+            attacker = create_pgd_attacker(test_eps, self.normalizer, self.cfg)
             
-            # 遍历测试集生成对抗样本
-            for batch_idx, batch in enumerate(self.test_loader):
-                inputs = batch['img'].to(self.device)
-                inputs *= std
-                inputs += mean
-                # 运行攻击
-                images_adv = attacker.run(surrogate, inputs, scaler=1, feature_layer='fc')
-                # 检查扰动限制
-                assert torch.max(images_adv - inputs) < (test_eps / 255. + 1e-6)
-                assert torch.min(images_adv - inputs) > (-test_eps / 255 - 1e-6)
-                images_adv = normalize(images_adv)
-                # 保存对抗样本
-                self.test_pkl[batch_idx * self.test_loader.batch_size: (batch_idx + 1) * self.test_loader.batch_size] = images_adv.cpu()
+            for batch_idx, batch in enumerate(data_loader):
+                # 直接是 [0,1] 像素空间图像，无需反归一化
+                inputs_pixel = batch['img'].to(self.device)
+                
+                # PGD 攻击（攻击器内部会归一化后传给网络）
+                images_adv_pixel = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc')
+                
+                # 验证扰动限制
+                eps_val = test_eps / 255.
+                assert torch.max(images_adv_pixel - inputs_pixel) < (eps_val + 1e-6)
+                assert torch.min(images_adv_pixel - inputs_pixel) > (-eps_val - 1e-6)
+                
+                # 归一化后保存（供 test_adv 使用）
+                images_adv_normalized = self.normalizer.normalize(images_adv_pixel)
+                start_idx = batch_idx * data_loader.batch_size
+                end_idx = start_idx + images_adv_normalized.shape[0]
+                self.test_pkl[start_idx:end_idx] = images_adv_normalized.cpu()
             
-            # 保存到文件
             torch.save(self.test_pkl, pkl_path)
             del surrogate
-
         else:
-            raise NameError
+            raise ValueError(f"Unknown attack type: {attack}")
+        
         torch.cuda.empty_cache()
 
     def before_black_test(self, path, attack='RAP'):
         """
         黑盒测试前的准备。
+        
+        使用统一的 ImageNormalizer 处理归一化操作。
         """
         pkl_path = '{}/{}_{}.pkl'.format(path, self.cfg.DATASET.NAME, attack)
         print("black test pkl_path:", pkl_path)
-        mean_value, std_value = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
-        mean = torch.tensor(mean_value).view(-1, 1, 1)
-        std = torch.tensor(std_value).view(-1, 1, 1)
-        normalize = transforms.Normalize(mean_value, std_value)
-        self.mean, self.std = mean, std
+        
+        # 初始化归一化器
+        self.normalizer = ImageNormalizer(device='cpu')
+        
         if os.path.isfile(pkl_path):
             self.test_pkl = torch.load(pkl_path, weights_only=False)
-            self.test_pkl = (self.test_pkl - mean) / std
+            # 归一化加载的图像（假设保存的是像素空间图像）
+            self.test_pkl = self.normalizer.normalize(self.test_pkl)
             return
         else:
             raise FileNotFoundError(
@@ -766,6 +792,8 @@ class SimpleTrainer(TrainerBase):
     def test_adv(self, split=None):
         """
         对抗性测试流程。
+        
+        使用统一的 ImageNormalizer 处理归一化操作。
         """
         self.set_model_mode("eval")
         self.evaluator.reset()
@@ -776,41 +804,32 @@ class SimpleTrainer(TrainerBase):
         if split == "val" and self.val_loader is not None:
             data_loader = self.val_loader
         else:
-            split = "test"  # 默认使用测试集
+            split = "test"
             data_loader = self.test_loader
 
+        # 确保 normalizer 已初始化
+        if not hasattr(self, 'normalizer'):
+            self.normalizer = ImageNormalizer(device=self.device)
+        else:
+            self.normalizer.to(self.device)
+
+        test_eps = self.cfg.DATASET.TEST_EPS / 255.0
         array_to_pkl = self.test_pkl
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1).to(self.device)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1).to(self.device)
 
         print(f"Evaluate on the *{split}* set")
-        # 遍历数据加载器进行测试
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
+            
             # 获取对应的对抗样本
-            input_adv = array_to_pkl[batch_idx * data_loader.batch_size: (batch_idx + 1) * data_loader.batch_size]
-            input_adv = input_adv.to(input.device)
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + input.shape[0]
+            input_adv = array_to_pkl[start_idx:end_idx].to(input.device)
 
-            # 限制噪声幅度 (claim small noise)
-            # 使用配置中的 TEST_EPS 而不是硬编码值
-            test_eps = self.cfg.DATASET.TEST_EPS / 255.0
-            x_adv = input_adv*std + mean
-            x = input*std + mean
-            noise = x_adv-x
-            noise = torch.clamp(noise, -test_eps, test_eps) # 限制噪声在L_inf ball内
-            x_adv = x+noise
-            x_adv = torch.clamp(x_adv, 0, 1) # 限制图像在[0, 1]范围
-            
-            # 验证约束
-            assert (torch.max(x_adv - x) < (test_eps + 1e-6))
-            assert (torch.min(x_adv - x) > (-test_eps - 1e-6))
-            
-            # 重新归一化
-            input_adv = (x_adv-mean)/std
+            # 使用 normalizer 统一处理扰动限制
+            input_adv = self.normalizer.clamp_perturbation(input_adv, input, test_eps)
 
             # 模型推理
             output = self.model_inference(input_adv)
-            # 记录评估结果
             self.evaluator.process(output, label.to(input.device))
 
         # 计算指标
@@ -824,12 +843,12 @@ class SimpleTrainer(TrainerBase):
     def test_adaptive_attack(self, split=None):
         """
         Adaptive Attack Test:
-        Generate PGD attacks using the full model gradient (including ODE part).
-        This tests if the defense holds up when the attacker knows the defense mechanism.
-        """
-        self.set_model_mode("eval") # 必须设为eval，但我们需要梯度回传到输入
-        # 注意：虽然是eval模式，但我们仍然可以通过 set_requires_grad(True) 来求输入的梯度
+        使用完整模型梯度（包括 ODE 部分）生成 PGD 攻击。
+        测试防御是否能在攻击者了解防御机制时仍然有效。
         
+        使用统一的 ImageNormalizer 处理归一化操作。
+        """
+        self.set_model_mode("eval")
         self.evaluator.reset()
 
         if split is None:
@@ -841,72 +860,50 @@ class SimpleTrainer(TrainerBase):
             split = "test"
             data_loader = self.test_loader
 
-        print(f"Evaluate on the *{split}* set with Adaptive PGD Attack (Gradient through ODE)")
+        print(f"Evaluate on the *{split}* set with Adaptive PGD Attack")
         
-        # Setup Normalization
-        mean_val = [0.48145466, 0.4578275, 0.40821073]
-        std_val = [0.26862954, 0.26130258, 0.27577711]
-        mean = torch.tensor(mean_val).view(-1, 1, 1).to(self.device)
-        std = torch.tensor(std_val).view(-1, 1, 1).to(self.device)
+        # 使用统一的归一化器
+        if not hasattr(self, 'normalizer'):
+            self.normalizer = ImageNormalizer(device=self.device)
+        else:
+            self.normalizer.to(self.device)
         
-        # Parameters
+        # 攻击参数
         test_eps = self.cfg.DATASET.TEST_EPS
         eps_val = test_eps / 255.0
-        n_iters = 40  # Strong attack
+        n_iters = 40
         alpha = 2.0 / 255.0
 
         for batch_idx, batch in enumerate(tqdm(data_loader)):
             input, label = self.parse_batch_test(batch)
             label = label.to(self.device)
             
-            # --- Adaptive PGD Attack Start ---
-            
-            # Start from clean images (already normalized in loader)
+            # 从干净图像开始
             images = input.clone().detach()
             
-            # Initialize perturbation in normalized space
-            # 为了计算方便，我们在归一化空间进行梯度更新，但在截断时还原到像素空间
-            delta = torch.zeros_like(images).uniform_(-0.01, 0.01) # Small random init
+            # 初始化扰动
+            delta = torch.zeros_like(images).uniform_(-0.01, 0.01)
             delta.requires_grad = True
             
             for _ in range(n_iters):
-                # Forward pass through FULL model (including ODE)
                 adv_input = images + delta
-                
-                # 重要：清空模型梯度
                 self.model.zero_grad()
                 
                 output = self.model(adv_input)
                 loss = F.cross_entropy(output, label)
                 
-                # Calculate gradient of loss w.r.t delta
                 grad = torch.autograd.grad(loss, delta, retain_graph=False)[0]
-                
-                # PGD Update: Maximize Loss
                 delta.data = delta.data + alpha * grad.sign()
                 
-                # Projection / Clamping
-                # 1. Denormalize to pixel space
-                x_adv = (images + delta) * std + mean
-                x_clean = images * std + mean
-                
-                # 2. Clamp perturbation magnitude (L_inf)
-                diff = x_adv - x_clean
-                diff = torch.clamp(diff, -eps_val, eps_val)
-                x_adv = x_clean + diff
-                
-                # 3. Clamp to valid image range [0, 1]
-                x_adv = torch.clamp(x_adv, 0.0, 1.0)
-                
-                # 4. Normalize back
-                delta.data = ((x_adv - mean) / std) - images
+                # 使用 normalizer 进行扰动限制
+                adv_normalized = images + delta
+                adv_clamped = self.normalizer.clamp_perturbation(adv_normalized, images, eps_val)
+                delta.data = adv_clamped - images
 
-            # Final adversarial images
+            # 最终对抗样本
             input_adv = images + delta.detach()
-            
-            # --- Adaptive PGD Attack End ---
 
-            # Inference on adaptive adversarial examples
+            # 推理
             output = self.model_inference(input_adv)
             self.evaluator.process(output, label)
 
@@ -1122,83 +1119,6 @@ class TrainerX(SimpleTrainer):
                 print(" ".join(info))
 
             # 写入TensorBoard
-            n_iter = self.epoch * self.num_batches + self.batch_idx
-            for name, meter in losses.meters.items():
-                self.write_scalar("train/" + name, meter.avg, n_iter)
-            self.write_scalar("train/lr", self.get_current_lr(), n_iter)
-
-            end = time.time()
-
-    def run_adv_training(self):
-        """
-        在线对抗训练（Online Adversarial Training）：在每个batch中动态生成对抗样本。
-        """
-        self.set_model_mode("train")
-        losses = MetricMeter()
-        batch_time = AverageMeter()
-        data_time = AverageMeter()
-        self.num_batches = len(self.train_loader_x)
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1).to(self.device)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1).to(self.device)
-
-        train_eps = self.cfg.DATASET.TRAIN_EPS
-        normalize = transforms.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
-        # clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
-        
-        # 准备代理模型
-        surrogate = ClipModel(model=self.model.image_encoder, num_classes=2).eval().to(self.device)
-        attacker = PGD(train_eps / 255., preprocess=normalize, num_iters=10)
-
-        end = time.time()
-        for self.batch_idx, batch in enumerate(self.train_loader_x):
-            data_time.update(time.time() - end)
-            
-            # 准备输入数据
-            inputs = batch['img'].to(self.device)
-            inputs *= std
-            inputs += mean # 还原归一化
-            
-            # 生成对抗样本
-            self.model.image_encoder.eval()
-            images_adv = attacker.run(surrogate, inputs, scaler=1, feature_layer='fc')
-            self.model.image_encoder.train()
-            
-            # 检查扰动限制
-            assert torch.max(images_adv - inputs) < (train_eps / 255. + 1e-6)
-            assert torch.min(images_adv - inputs) > (-train_eps / 255 - 1e-6)
-            
-            # 重新归一化并替换batch中的图像
-            images_adv = normalize(images_adv)
-            batch['img'] = images_adv
-            
-            # 使用对抗样本进行训练
-            loss_summary = self.forward_backward(batch)
-            
-            batch_time.update(time.time() - end)
-            losses.update(loss_summary)
-
-            # 日志记录...
-            meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
-            only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
-            if meet_freq or only_few_batches:
-                nb_remain = 0
-                nb_remain += self.num_batches - self.batch_idx - 1
-                nb_remain += (
-                                     self.max_epoch - self.epoch - 1
-                             ) * self.num_batches
-                eta_seconds = batch_time.avg * nb_remain
-                eta = str(datetime.timedelta(seconds=int(eta_seconds)))
-
-                info = []
-                info += [f"epoch [{self.epoch + 1}/{self.max_epoch}]"]
-                info += [f"batch [{self.batch_idx + 1}/{self.num_batches}]"]
-                info += [f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"]
-                info += [f"data {data_time.val:.3f} ({data_time.avg:.3f})"]
-                info += [f"{losses}"]
-                info += [f"lr {self.get_current_lr():.4e}"]
-                info += [f"eta {eta}"]
-                print(" ".join(info))
-
             n_iter = self.epoch * self.num_batches + self.batch_idx
             for name, meter in losses.meters.items():
                 self.write_scalar("train/" + name, meter.avg, n_iter)

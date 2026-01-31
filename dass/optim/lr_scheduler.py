@@ -22,10 +22,11 @@
 """
 
 import torch
+import warnings
 from torch.optim.lr_scheduler import _LRScheduler
 
 # 可用的调度策略
-AVAI_SCHEDS = ["single_step", "multi_step", "cosine"]
+AVAI_SCHEDS = ["single_step", "multi_step", "cosine", "plateau"]
 
 
 class _BaseWarmupScheduler(_LRScheduler):
@@ -236,8 +237,24 @@ def build_lr_scheduler(optimizer, optim_cfg):
             optimizer, float(max_epoch)
         )
 
+    # 验证集损失驱动的调度器（ReduceLROnPlateau）
+    elif lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=optim_cfg.PLATEAU_MODE,
+            factor=optim_cfg.PLATEAU_FACTOR,
+            patience=optim_cfg.PLATEAU_PATIENCE,
+            threshold=optim_cfg.PLATEAU_THRESHOLD,
+            min_lr=optim_cfg.PLATEAU_MIN_LR,
+        )
+
     # 添加预热
     if optim_cfg.WARMUP_EPOCH > 0:
+        if lr_scheduler == "plateau":
+            warnings.warn(
+                "Warmup is not applied to ReduceLROnPlateau; set WARMUP_EPOCH<=0."
+            )
+            return scheduler
         if not optim_cfg.WARMUP_RECOUNT:
             scheduler.last_epoch = optim_cfg.WARMUP_EPOCH
 
