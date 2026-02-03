@@ -174,9 +174,9 @@ def extend_cfg(cfg):
     # 数据集和数据加载配置
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"         # 子采样策略：all/base/new
     cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256  # 嵌入bank的batch大小
-    cfg.DATASET.TRAIN_EPS = 24                    # 训练扰动强度（16/255 ≈ 0.063）
+    cfg.DATASET.TRAIN_EPS = 20                    # 训练扰动强度（16/255 ≈ 0.063）
     cfg.DATASET.TEST_EPS = 16                     # 测试扰动强度（16/255 ≈ 0.063）
-    cfg.DATASET.Train_PGD_NUM_ITERS = 100                # PGD攻击迭代次数（训练和测试统一）
+    cfg.DATASET.Train_PGD_NUM_ITERS = 60                # PGD攻击迭代次数（训练和测试统一）
     cfg.DATASET.Test_PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
 
     cfg.MODEL.FILE_PREFIX = "model"               # 模型文件名前缀
@@ -350,10 +350,10 @@ def main(args):
         trainer.test_adv()
         print('-' * 60)
 
-        print('robust acc(PGD) - embedding path (unified with training):')
-        trainer.generate_test_embedding(args.path)
-        trainer.test_adv_embedding(split="test")
-        print('-' * 60)
+        # print('robust acc(PGD) - embedding path (unified with training):')
+        # trainer.generate_test_embedding(args.path)
+        # trainer.test_adv_embedding(split="test")
+        # print('-' * 60)
 
         # print('adaptive attack acc:')
         # trainer.test_adaptive_attack()

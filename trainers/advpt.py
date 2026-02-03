@@ -966,58 +966,58 @@ class AdvPT(TrainerX):
         return self._test_impl(split, max_batches=max_batches, use_adv=True)
 
     @torch.no_grad()
-    def generate_test_embedding(self, path):
-        """
-        将测试集的对抗图像转换为嵌入向量
+    # def generate_test_embedding(self, path):
+    #     """
+    #     将测试集的对抗图像转换为嵌入向量
         
-        这确保测试时使用与训练相同的代码路径 (forward_embedding)
-        """
-        pkl_path = '{}/{}_{}_{}_embedding.pkl'.format(
-            path, self.cfg.DATASET.NAME,
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"), 'PGD'
-        )
+    #     这确保测试时使用与训练相同的代码路径 (forward_embedding)
+    #     """
+    #     pkl_path = '{}/{}_{}_{}_embedding.pkl'.format(
+    #         path, self.cfg.DATASET.NAME,
+    #         self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"), 'PGD'
+    #     )
         
-        if os.path.isfile(pkl_path):
-            self.test_embedding_pkl = torch.load(pkl_path, map_location='cpu')
-            print(f'[generate_test_embedding] Loaded test_embedding_pkl from {pkl_path}')
-            return
+    #     if os.path.isfile(pkl_path):
+    #         self.test_embedding_pkl = torch.load(pkl_path, map_location='cpu')
+    #         print(f'[generate_test_embedding] Loaded test_embedding_pkl from {pkl_path}')
+    #         return
         
-        print("[generate_test_embedding] Converting test adversarial images to embeddings...")
+    #     print("[generate_test_embedding] Converting test adversarial images to embeddings...")
         
-        # 确保 test_pkl 存在（对抗图像）
-        if not hasattr(self, 'test_pkl') or self.test_pkl is None:
-            raise RuntimeError("test_pkl not found. Call before_adv_test first.")
+    #     # 确保 test_pkl 存在（对抗图像）
+    #     if not hasattr(self, 'test_pkl') or self.test_pkl is None:
+    #         raise RuntimeError("test_pkl not found. Call before_adv_test first.")
         
-        model = self.model.module if hasattr(self.model, 'module') else self.model
-        image_encoder = model.image_encoder
-        dtype = model.dtype
+    #     model = self.model.module if hasattr(self.model, 'module') else self.model
+    #     image_encoder = model.image_encoder
+    #     dtype = model.dtype
         
-        # test_pkl 已经是归一化后的图像
-        num_samples = self.test_pkl.shape[0]
-        embedding_dim = image_encoder.output_dim
-        self.test_embedding_pkl = torch.empty(size=[num_samples, embedding_dim])
+    #     # test_pkl 已经是归一化后的图像
+    #     num_samples = self.test_pkl.shape[0]
+    #     embedding_dim = image_encoder.output_dim
+    #     self.test_embedding_pkl = torch.empty(size=[num_samples, embedding_dim])
         
-        batch_size = self.cfg.DATALOADER.TEST.BATCH_SIZE
-        num_batches = (num_samples + batch_size - 1) // batch_size
+    #     batch_size = self.cfg.DATALOADER.TEST.BATCH_SIZE
+    #     num_batches = (num_samples + batch_size - 1) // batch_size
         
-        image_encoder.eval()
+    #     image_encoder.eval()
         
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_samples)
+    #     for batch_idx in range(num_batches):
+    #         start_idx = batch_idx * batch_size
+    #         end_idx = min(start_idx + batch_size, num_samples)
             
-            images = self.test_pkl[start_idx:end_idx].to(self.device)
+    #         images = self.test_pkl[start_idx:end_idx].to(self.device)
             
-            with torch.no_grad():
-                embedding = image_encoder(images.type(dtype))
+    #         with torch.no_grad():
+    #             embedding = image_encoder(images.type(dtype))
             
-            self.test_embedding_pkl[start_idx:end_idx] = embedding.cpu().float()
+    #         self.test_embedding_pkl[start_idx:end_idx] = embedding.cpu().float()
             
-            if (batch_idx + 1) % 20 == 0:
-                print(f"  Processed {batch_idx + 1}/{num_batches} batches")
+    #         if (batch_idx + 1) % 20 == 0:
+    #             print(f"  Processed {batch_idx + 1}/{num_batches} batches")
         
-        torch.save(self.test_embedding_pkl, pkl_path)
-        print(f'[generate_test_embedding] Saved test_embedding_pkl to {pkl_path}')
+    #     torch.save(self.test_embedding_pkl, pkl_path)
+    #     print(f'[generate_test_embedding] Saved test_embedding_pkl to {pkl_path}')
 
     @torch.no_grad()
     def test_adv_embedding(self, split="test", max_batches=None):
@@ -1034,11 +1034,11 @@ class AdvPT(TrainerX):
             data_loader = self.val_loader
         else:
             split = "test"
-            # 优先使用嵌入版本，否则实时转换
-            if hasattr(self, 'test_embedding_pkl') and self.test_embedding_pkl is not None:
-                embedding_pkl = self.test_embedding_pkl
-            else:
-                raise RuntimeError("test_embedding_pkl not found. Call generate_test_embedding first.")
+            # if hasattr(self, 'test_embedding_pkl') and self.test_embedding_pkl is not None:
+            #     embedding_pkl = self.test_embedding_pkl
+            # else:
+            #     raise RuntimeError("test_embedding_pkl not found. Call generate_test_embedding first.") 
+            # 废弃的测试路径
             data_loader = self.test_loader
         
         batch_info = f"first {max_batches} batches" if max_batches else "all"

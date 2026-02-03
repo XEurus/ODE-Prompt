@@ -15,7 +15,7 @@ Best_Model=resnet_model-best.pth.tar
 D=$ROOT
 SEED=1
 
-DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/4-2_resnet_PGD40_16_mix
+DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/4-3_resnet_PGD40_16_mix
 PYTHON="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/dassl/bin/python"
 echo "--------------------------------------------------------------------------------------"
 $PYTHON train.py \
