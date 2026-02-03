@@ -535,8 +535,9 @@ class SimpleTrainer(TrainerBase):
 
         if attack == 'PGD':
             # 攻击器使用相同的 normalizer，内部会归一化后传给网络
-            attacker = create_pgd_attacker(train_eps, normalizer, self.cfg)
-            print(f"[before_adv_train] Using PGD attack with eps={train_eps}/255")
+            num_iters = getattr(self.cfg.DATASET, 'Train_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
+            attacker = create_pgd_attacker(train_eps, normalizer, self.cfg, num_iters=num_iters)
+            print(f"[before_adv_train] Using PGD attack with eps={train_eps}/255, iters={num_iters}")
         else:
             raise ValueError(f"Unknown attack type: {attack}")
 
@@ -582,6 +583,60 @@ class SimpleTrainer(TrainerBase):
         del surrogate
         torch.cuda.empty_cache()
 
+    def before_clean_train(self, path):
+        """
+        生成干净图像的嵌入向量（用于混合训练）
+        
+        流程：
+        1. 使用不带归一化的 DataLoader 获取 [0,1] 像素空间图像
+        2. 归一化后提取特征（无攻击）
+        """
+        pkl_path = '{}/{}_{}_clean.pkl'.format(
+            path, self.cfg.DATASET.NAME, 
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+        )
+        
+        if os.path.isfile(pkl_path):
+            self.clean_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
+            print(f'[before_clean_train] Loaded clean_pkl from {pkl_path}')
+            return
+        
+        print("[before_clean_train] Generating clean embeddings...")
+        
+        normalizer = ImageNormalizer(device=self.device)
+        
+        model = get_model(self.model)
+        image_encoder = model.image_encoder
+        dtype = model.dtype
+        
+        embedding_dim = image_encoder.output_dim
+        print(f"[before_clean_train] Embedding dimension: {embedding_dim}")
+        
+        data_loader = self.train_loader_x_notransform_noshuffle
+        self.clean_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
+        
+        image_encoder.eval()
+        
+        print(f"[before_clean_train] Processing {len(data_loader)} batches...")
+        for batch_idx, batch in enumerate(data_loader):
+            inputs_pixel = batch['img'].to(self.device)
+            
+            # 直接归一化（无攻击）
+            images_normalized = normalizer.normalize(inputs_pixel)
+            
+            with torch.no_grad():
+                embedding = image_encoder(images_normalized.type(dtype))
+
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + embedding.shape[0]
+            self.clean_pkl[start_idx:end_idx] = embedding.cpu().float()
+            
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
+
+        torch.save(self.clean_pkl, pkl_path)
+        print(f'[before_clean_train] Generated and saved clean_pkl to {pkl_path}')
+
     def before_adv_val(self, path, attack='PGD'):
         """
         生成验证集的对抗嵌入（用于每个 epoch 的验证）
@@ -620,8 +675,9 @@ class SimpleTrainer(TrainerBase):
         surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
 
         if attack == 'PGD':
-            attacker = create_pgd_attacker(val_eps, normalizer, self.cfg)
-            print(f"[before_adv_val] Using PGD attack with eps={val_eps}/255")
+            num_iters = getattr(self.cfg.DATASET, 'Test_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
+            attacker = create_pgd_attacker(val_eps, normalizer, self.cfg, num_iters=num_iters)
+            print(f"[before_adv_val] Using PGD attack with eps={val_eps}/255, iters={num_iters}")
         else:
             raise ValueError(f"Unknown attack type: {attack}")
 
@@ -690,7 +746,8 @@ class SimpleTrainer(TrainerBase):
                 print("[before_adv_test] CLIP model converted to fp32")
             
             surrogate = ClipModel(model=get_model(temp_model.visual), num_classes=2).eval().to(self.device)
-            attacker = create_pgd_attacker(test_eps, self.normalizer, self.cfg)
+            num_iters = getattr(self.cfg.DATASET, 'Test_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
+            attacker = create_pgd_attacker(test_eps, self.normalizer, self.cfg, num_iters=num_iters)
             
             for batch_idx, batch in enumerate(data_loader):
                 # 直接是 [0,1] 像素空间图像，无需反归一化
@@ -1130,13 +1187,18 @@ class TrainerX(SimpleTrainer):
         """
         运行预计算对抗特征的训练epoch。
         这里使用`before_adv_train`中预先生成的对抗样本特征(`self.train_pkl`)。
+        
+        支持混合训练：根据 MIX_CLEAN_RATIO 配置混合干净数据和对抗数据
         """
         self.set_model_mode("train")
         losses = MetricMeter()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        # self.num_batches = len(self.train_loader_x)
-        self.num_batches = len(self.train_loader_x_noshuffle) # 使用不打乱的加载器长度
+        self.num_batches = len(self.train_loader_x_noshuffle)
+
+        # 获取混合比例配置
+        mix_clean_ratio = getattr(self.cfg.TRAIN, 'MIX_CLEAN_RATIO', 0.0)
+        use_mixed = mix_clean_ratio > 0 and hasattr(self, 'clean_pkl') and self.clean_pkl is not None
 
         seed = torch.random.seed()
         torch.random.manual_seed(seed)
@@ -1146,18 +1208,38 @@ class TrainerX(SimpleTrainer):
         self.train_loader_x_noshuffle.dataset.data_source = [self.train_loader_x_noshuffle.dataset.data_source[i] for i
                                                              in length]
         self.train_pkl = self.train_pkl[torch.LongTensor(length)]
+        
+        # 同步打乱干净嵌入
+        if use_mixed:
+            self.clean_pkl = self.clean_pkl[torch.LongTensor(length)]
 
         end = time.time()
         for self.batch_idx, batch in enumerate(self.train_loader_x_noshuffle):
 
             data_time.update(time.time() - end)
 
-            # 获取当前batch对应的预计算对抗特征
-            images_adv = self.train_pkl[self.batch_idx * self.train_loader_x_noshuffle.batch_size: (
-                                                                                                           self.batch_idx + 1) * self.train_loader_x_noshuffle.batch_size]
-            batch_dict = {'batch': batch, 'images_adv': images_adv.to(self.device)}
+            # 获取当前batch对应的预计算特征
+            start_idx = self.batch_idx * self.train_loader_x_noshuffle.batch_size
+            end_idx = (self.batch_idx + 1) * self.train_loader_x_noshuffle.batch_size
+            
+            images_adv = self.train_pkl[start_idx:end_idx]
+            
+            # 混合训练：按比例混合干净和对抗嵌入
+            if use_mixed:
+                images_clean = self.clean_pkl[start_idx:end_idx]
+                batch_size = images_adv.shape[0]
+                
+                # 为每个样本随机决定使用干净还是对抗嵌入
+                mix_mask = torch.rand(batch_size) < mix_clean_ratio
+                mix_mask = mix_mask.unsqueeze(1).expand_as(images_adv)
+                
+                # 混合：clean * mask + adv * (1 - mask)
+                images_mixed = torch.where(mix_mask, images_clean, images_adv)
+                batch_dict = {'batch': batch, 'images_adv': images_mixed.to(self.device)}
+            else:
+                batch_dict = {'batch': batch, 'images_adv': images_adv.to(self.device)}
 
-            # 进行训练步骤（通常是Prompt Tuning或其他利用特征的训练）
+            # 进行训练步骤
             loss_summary = self.forward_backward_adv(batch_dict)
             
             batch_time.update(time.time() - end)

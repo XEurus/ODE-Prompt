@@ -174,9 +174,10 @@ def extend_cfg(cfg):
     # 数据集和数据加载配置
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"         # 子采样策略：all/base/new
     cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256  # 嵌入bank的batch大小
-    cfg.DATASET.TRAIN_EPS = 16                    # 训练扰动强度（16/255 ≈ 0.063）
+    cfg.DATASET.TRAIN_EPS = 24                    # 训练扰动强度（16/255 ≈ 0.063）
     cfg.DATASET.TEST_EPS = 16                     # 测试扰动强度（16/255 ≈ 0.063）
-    cfg.DATASET.PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
+    cfg.DATASET.Train_PGD_NUM_ITERS = 100                # PGD攻击迭代次数（训练和测试统一）
+    cfg.DATASET.Test_PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
 
     cfg.MODEL.FILE_PREFIX = "model"               # 模型文件名前缀
 
@@ -270,14 +271,19 @@ def main(args):
         trainer.before_adv_test(args.path, args.white_attack)
         trainer.test_adv()
         print('-' * 60)
-        
+
+        print('robust acc(PGD) - embedding path (unified with training):')
+        trainer.generate_test_embedding(args.path)
+        trainer.test_adv_embedding(split="test")
+        print('-' * 60)
+
         # print('Adaptive attack accuracy:')
         # trainer.test_adaptive_attack()
         # print('-' * 60)
-        # return
+        return
 
     # ========== 黑盒攻击评估模式 ==========
-    if args.eval_black:
+    elif args.eval_black:
         trainer.load_model(args.model_dir, epoch=args.load_epoch, model_file=args.model_file)
         print(f"Model loaded from: {args.model_dir}")
         print('-' * 60)
@@ -308,13 +314,16 @@ def main(args):
             print('Preparing adversarial training data...')
             print('=' * 60)
             
-            print('\n[1/3] Generating/Loading training adversarial embeddings...')
+            print('\n[1/4] Generating/Loading training adversarial embeddings...')
             trainer.before_adv_train(path=args.path, attack='PGD')
             
-            print('\n[2/3] Generating/Loading validation adversarial embeddings...')
+            print('\n[2/4] Generating/Loading training clean embeddings (for mixed training)...')
+            trainer.before_clean_train(path=args.path)
+            
+            print('\n[3/4] Generating/Loading validation adversarial embeddings...')
             trainer.before_adv_val(path=args.path, attack='PGD')
             
-            print('\n[3/3] Generating/Loading test adversarial samples...')
+            print('\n[4/4] Generating/Loading test adversarial samples...')
             trainer.before_adv_test(path=args.path, attack='PGD')
             
             print('=' * 60)
@@ -337,9 +346,13 @@ def main(args):
         # trainer.test_adv()
         # print('-' * 60)
 
-        print('robust acc(PGD):')
-        #trainer.before_adv_test(args.path, args.white_attack)
+        print('robust acc(PGD) - image path:')
         trainer.test_adv()
+        print('-' * 60)
+
+        print('robust acc(PGD) - embedding path (unified with training):')
+        trainer.generate_test_embedding(args.path)
+        trainer.test_adv_embedding(split="test")
         print('-' * 60)
 
         # print('adaptive attack acc:')
@@ -386,4 +399,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # 启动主程序
+    print("DEBUG: args.eval_only =", args.eval_only)
+    print("DEBUG: args.adv_training =", args.adv_training)
     main(args)

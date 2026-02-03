@@ -84,6 +84,10 @@ _C.DATASET.STL10_FOLD = -1
 # CIFAR-10/100-C's corruption type and intensity level
 _C.DATASET.CIFAR_C_TYPE = ""
 _C.DATASET.CIFAR_C_LEVEL = 1
+# PGD Attack Iterations
+_C.DATASET.PGD_NUM_ITERS = 40
+_C.DATASET.Train_PGD_NUM_ITERS = 40
+_C.DATASET.Test_PGD_NUM_ITERS = 40
 # Use all data in the unlabeled data set (e.g. FixMatch)
 _C.DATASET.ALL_AS_UNLABELED = False
 
@@ -198,6 +202,10 @@ _C.TRAIN = CN()
 _C.TRAIN.CHECKPOINT_FREQ = 0
 # How often (batch) to print training information
 _C.TRAIN.PRINT_FREQ = 10
+# Count samples from these datasets
+_C.TRAIN.COUNT_NET = ()
+# Mixed training ratio (0.0=pure adversarial, 1.0=pure clean)
+_C.TRAIN.MIX_CLEAN_RATIO = 0.0
 # Use 'train_x', 'train_u' or 'smaller_one' to count
 # the number of iterations in an epoch (for DA and SSL)
 _C.TRAIN.COUNT_ITER = "train_x"
