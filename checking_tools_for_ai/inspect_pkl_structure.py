@@ -2,7 +2,7 @@ import torch
 import os
 import numpy as np
 
-data_dir = '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/pkl_data'
+data_dir = '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/pkl_data'
 files = [
     'OxfordPets_ViT-B_16_PGD.pkl',
     'OxfordPets_ViT-B_16_v2.pkl',

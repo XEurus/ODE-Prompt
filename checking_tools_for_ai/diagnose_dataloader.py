@@ -54,7 +54,7 @@ def diagnose():
     cfg.merge_from_file("configs/datasets/oxford_pets.yaml")
     cfg.merge_from_file("configs/trainers/AdvPT/vit_b16.yaml")
     cfg.defrost()
-    cfg.DATASET.ROOT = "/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data"
+    cfg.DATASET.ROOT = "/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data"
     cfg.freeze()
     
     if cfg.SEED >= 0:

@@ -202,6 +202,9 @@ _C.TRAIN = CN()
 _C.TRAIN.CHECKPOINT_FREQ = 0
 # How often (batch) to print training information
 _C.TRAIN.PRINT_FREQ = 10
+# Optional root directory for TensorBoard logs.
+# If empty, it will be inferred from OUTPUT_DIR.
+_C.TRAIN.TENSORBOARD_DIR = ""
 # Count samples from these datasets
 _C.TRAIN.COUNT_NET = ()
 # Mixed training ratio (0.0=pure adversarial, 1.0=pure clean)
@@ -230,6 +233,8 @@ _C.TEST.FINAL_MODEL = "last_step"
 # Number of batches to test per epoch (for quick evaluation)
 # Set to -1 to test the entire dataset
 _C.TEST.EPOCH_TEST_BATCHES = 2
+# Number of TEST batches to evaluate each epoch in addition to val
+_C.TEST.PARTIAL_TEST_BATCHES = 10
 
 ###########################
 # Trainer specifics

@@ -311,7 +311,7 @@ class TrainerBase:
         self.start_epoch = start_epoch
         self.max_epoch = max_epoch
         print("adv_training: ", adv_training)
-        # self.before_train() # 注意：before_train通常在调用此方法前手动调用或在子类中处理
+        self.before_train()
         # if adv_training:
         #     # 如果是对抗训练，进行预处理（例如生成对抗样本）
         #     self.before_adv_train(path=path)
@@ -489,10 +489,48 @@ class SimpleTrainer(TrainerBase):
             directory = self.cfg.RESUME
         self.start_epoch = self.resume_model_if_exist(directory)
 
-        # 初始化summary writer
-        writer_dir = osp.join(self.output_dir, "tensorboard")
+        # 初始化 summary writer
+        # 支持将多个实验写入统一根目录，便于跨实验对比。
+        tb_root = getattr(self.cfg.TRAIN, "TENSORBOARD_DIR", "")
+        if tb_root:
+            tb_base_dir = tb_root
+        elif f"{osp.sep}adv{osp.sep}" in osp.normpath(self.output_dir):
+            # output_dir 形如: .../<cfg>/adv/<exp_name> -> 聚合到 .../<cfg>
+            tb_base_dir = osp.dirname(osp.dirname(self.output_dir))
+        else:
+            tb_base_dir = self.output_dir
+
+        run_name = osp.basename(osp.normpath(self.output_dir))
+        writer_dir = osp.join(tb_base_dir, "tensorboard", run_name)
         mkdir_if_missing(writer_dir)
         self.init_writer(writer_dir)
+
+        if self._writer is not None:
+            self._writer.add_text("runtime/output_dir", self.output_dir, 0)
+            self._writer.add_text("runtime/tensorboard_writer_dir", writer_dir, 0)
+
+            args_cfg_path = osp.join(self.output_dir, "args_config.txt")
+            if osp.isfile(args_cfg_path):
+                with open(args_cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                    args_cfg_text = f.read()
+                self._writer.add_text("config/args_config", f"```\n{args_cfg_text}\n```", 0)
+
+            # 记录完整配置，便于在 TensorBoard 里追踪实验参数
+            self._writer.add_text("config/full", f"```\n{self.cfg.dump()}\n```", 0)
+            self._writer.add_text("hparams/optimizer_name", str(self.cfg.OPTIM.NAME), 0)
+            self._writer.add_text("hparams/lr_scheduler", str(self.cfg.OPTIM.LR_SCHEDULER), 0)
+            self._writer.add_text("hparams/backbone", str(self.cfg.MODEL.BACKBONE.NAME), 0)
+            self._writer.add_text("hparams/dataset", str(self.cfg.DATASET.NAME), 0)
+
+            # 记录关键超参数（标量形式，便于对比）
+            self.write_scalar("hparams/optim_lr", float(self.cfg.OPTIM.LR), 0)
+            self.write_scalar("hparams/optim_max_epoch", float(self.cfg.OPTIM.MAX_EPOCH), 0)
+            self.write_scalar("hparams/train_batch_size", float(self.cfg.DATALOADER.TRAIN_X.BATCH_SIZE), 0)
+            self.write_scalar("hparams/mix_clean_ratio", float(getattr(self.cfg.TRAIN, "MIX_CLEAN_RATIO", 0.0)), 0)
+            self.write_scalar("hparams/adv_n_ctx", float(getattr(self.cfg.TRAINER.ADV, "N_CTX", 0)), 0)
+            self.write_scalar("hparams/epoch_test_batches", float(getattr(self.cfg.TEST, "EPOCH_TEST_BATCHES", -1)), 0)
+            self.write_scalar("hparams/partial_test_batches", float(getattr(self.cfg.TEST, "PARTIAL_TEST_BATCHES", 10)), 0)
+            self.write_scalar("hparams/checkpoint_freq", float(getattr(self.cfg.TRAIN, "CHECKPOINT_FREQ", 0)), 0)
 
         # 记录开始时间
         self.time_start = time.time()
@@ -1109,6 +1147,13 @@ class TrainerXU(SimpleTrainer):
 
             end = time.time()
 
+        # epoch 级聚合指标
+        for name, meter in losses.meters.items():
+            self.write_scalar("epoch_train/" + name, meter.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/lr", self.get_current_lr(), self.epoch + 1)
+        self.write_scalar("epoch_train/batch_time_avg", batch_time.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
+
     def parse_batch_train(self, batch_x, batch_u):
         input_x = batch_x["img"]
         label_x = batch_x["label"]
@@ -1182,6 +1227,13 @@ class TrainerX(SimpleTrainer):
             self.write_scalar("train/lr", self.get_current_lr(), n_iter)
 
             end = time.time()
+
+        # epoch 级聚合指标
+        for name, meter in losses.meters.items():
+            self.write_scalar("epoch_train/" + name, meter.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/lr", self.get_current_lr(), self.epoch + 1)
+        self.write_scalar("epoch_train/batch_time_avg", batch_time.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
 
     def run_epoch_adv(self):
         """
@@ -1273,6 +1325,15 @@ class TrainerX(SimpleTrainer):
             self.write_scalar("train/lr", self.get_current_lr(), n_iter)
 
             end = time.time()
+
+        # epoch 级聚合指标
+        for name, meter in losses.meters.items():
+            self.write_scalar("epoch_train/" + name, meter.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/lr", self.get_current_lr(), self.epoch + 1)
+        self.write_scalar("epoch_train/batch_time_avg", batch_time.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/mix_clean_ratio", float(mix_clean_ratio), self.epoch + 1)
+        self.write_scalar("epoch_train/use_mixed", 1.0 if use_mixed else 0.0, self.epoch + 1)
 
     def parse_batch_train(self, batch):
         input = batch["img"]

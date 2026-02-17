@@ -1,7 +1,7 @@
 import json
 import os
 
-split_path = '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data/oxford_pets/split_zhou_OxfordPets.json'
+split_path = '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data/oxford_pets/split_zhou_OxfordPets.json'
 
 try:
     with open(split_path, 'r') as f:

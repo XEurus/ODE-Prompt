@@ -7,8 +7,8 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 # Paths
-data_dir = '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/pkl_data'
-split_path = '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data/oxford_pets/split_zhou_OxfordPets.json'
+data_dir = '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/pkl_data'
+split_path = '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data/oxford_pets/split_zhou_OxfordPets.json'
 output_plot = 'distribution_plot.png'
 
 # Load Split Info

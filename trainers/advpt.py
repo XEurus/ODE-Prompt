@@ -48,7 +48,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/clip')
+    model_path = clip._download(url, '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/clip')
 
     try:
         # loading JIT archive
@@ -728,6 +728,7 @@ class AdvPT(TrainerX):
         
         # 获取每个 epoch 测试的 batch 数量
         max_batches = getattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES', 2)
+        partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
         
         # 1. 训练集对抗准确率
         train_acc = None
@@ -753,25 +754,34 @@ class AdvPT(TrainerX):
                 max_batches=max_batches
             )
             print(f"      Val Adv Acc: {val_acc:.2f}%")
-            if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-                val_loss = self._eval_adv_embedding_loss(
-                    self.val_pkl,
-                    self.val_loader,
-                    max_batches=max_batches
-                )
+            # if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
+            val_loss = self._eval_adv_embedding_loss(
+                self.val_pkl,
+                self.val_loader,
+                max_batches=max_batches
+            )
         elif hasattr(self, 'test_pkl') and self.test_pkl is not None:
             # 如果没有验证集对抗嵌入，使用测试集
             print(f'\n[2/2] Test Adversarial Accuracy (no val_pkl):')
             val_acc = self.test_adv_partial(split="test", max_batches=max_batches)
             print(f"      Test Adv Acc: {val_acc:.2f}%")
-            if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-                val_loss = self._eval_adv_embedding_loss(
-                    self.test_pkl,
-                    self.test_loader,
-                    max_batches=max_batches
-                )
+            #if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
+            val_loss = self._eval_adv_embedding_loss(
+                self.test_pkl,
+                self.test_loader,
+                max_batches=max_batches
+            )
         else:
             print(f'\n[2/2] Validation adversarial test skipped')
+
+        # 3. 每个 epoch 额外评估部分 test（用于观察 val/test 偏差）
+        test_partial_acc = None
+        if hasattr(self, 'test_pkl') and self.test_pkl is not None:
+            print(f'\n[Extra] Partial Test Adversarial Accuracy ({partial_test_batches} batches):')
+            test_partial_acc = self.test_adv_partial(split="test", max_batches=partial_test_batches)
+            print(f"      Test Partial Adv Acc: {test_partial_acc:.2f}%")
+        else:
+            print(f'\n[Extra] Partial test adversarial evaluation skipped (test_pkl not prepared)')
         
         # 打印摘要
         summary_parts = []
@@ -779,6 +789,8 @@ class AdvPT(TrainerX):
             summary_parts.append(f"Train: {train_acc:.2f}%")
         if val_acc is not None:
             summary_parts.append(f"Val: {val_acc:.2f}%")
+        if test_partial_acc is not None:
+            summary_parts.append(f"Test@{partial_test_batches}b: {test_partial_acc:.2f}%")
         if summary_parts:
             print(f"\n[Summary] {' | '.join(summary_parts)}")
         
@@ -789,6 +801,20 @@ class AdvPT(TrainerX):
             self.write_scalar("epoch/val_adv_acc", val_acc, self.epoch)
         if val_loss is not None:
             self.write_scalar("epoch/val_adv_loss", val_loss, self.epoch)
+        if test_partial_acc is not None:
+            self.write_scalar("epoch/test_partial_adv_acc", test_partial_acc, self.epoch)
+        if val_acc is not None and test_partial_acc is not None:
+            gap = val_acc - test_partial_acc
+            self.write_scalar("epoch/val_test_gap", gap, self.epoch)
+            self.write_scalar("epoch/val_test_gap_abs", abs(gap), self.epoch)
+
+        # 统一打印一行结构化指标，便于日志解析/画图
+        print(
+            f"[EpochMetrics] epoch={self.epoch + 1} "
+            f"train_adv_acc={train_acc if train_acc is not None else 'NA'} "
+            f"val_adv_acc={val_acc if val_acc is not None else 'NA'} "
+            f"test_partial_adv_acc={test_partial_acc if test_partial_acc is not None else 'NA'}"
+        )
 
         # 使用验证集损失驱动学习率调整（ReduceLROnPlateau）
         if self.cfg.OPTIM.LR_SCHEDULER == "plateau" and val_loss is not None:
