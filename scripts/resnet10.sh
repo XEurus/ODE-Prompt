@@ -1,9 +1,9 @@
 
 # custom config
 ROOT="/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/Data"
-TRAINER=AdvPT
+TRAINER=resnet10
 # oxford_flowers, oxford_pets, imagenet, food101, sun397, dtd, eurosat, ucf101
-DATASET=dtd
+DATASET=oxford_pets
 # rn50, vit_b16, vit_l14
 CFG=vit_b16 # config file
 CTP=end  # class token position (end or middle)

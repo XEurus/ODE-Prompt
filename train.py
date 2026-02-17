@@ -60,33 +60,44 @@ import datasets.imagenet_r        # ImageNet 渲染版本
 # 训练器导入 - 注册训练算法
 # ============================================================================
 import trainers.advpt             # ODE-Prompt 对抗提示学习训练器
+import trainers.mlp               # MLP-Prompt 对抗提示学习训练器
+import trainers.resnet10          # resnet10 对抗提示学习训练器
 import trainers.zsclip            # 零样本 CLIP 基线
 
 # 默认精度设置：fp16 用于加速训练，fp32 用于稳定性
 prec = 'fp16'
 
 
-def print_args(args, cfg):
+def print_args(args, cfg, output_dir=None):
     """
-    打印命令行参数和配置信息
-    
+    打印命令行参数和配置信息到日志和文件
+
     用于调试和实验记录，确保实验可复现性
-    
-    参数：
-        args: 命令行参数对象
-        cfg: YACS 配置节点对象
     """
-    print("***************")
-    print("** Arguments **")
-    print("***************")
-    optkeys = list(args.__dict__.keys())
-    optkeys.sort()
+    # 构建输出字符串
+    lines = []
+    lines.append("=" * 60)
+    lines.append("Arguments")
+    lines.append("=" * 60)
+    optkeys = sorted(args.__dict__.keys())
     for key in optkeys:
-        print("{}: {}".format(key, args.__dict__[key]))
-    print("************")
-    print("** Config **")
-    print("************")
-    print(cfg)
+        lines.append("{}: {}".format(key, args.__dict__[key]))
+    lines.append("=" * 60)
+    lines.append("Config")
+    lines.append("=" * 60)
+    lines.append(str(cfg))
+    lines.append("=" * 60)
+
+    # 打印到控制台/日志（sys.stdout 已被重定向）
+    for line in lines:
+        print(line)
+
+    # 同时保存到独立参数文件
+    if output_dir is not None:
+        import os.path as osp
+        fpath = osp.join(output_dir, "args_config.txt")
+        with open(fpath, "w") as f:
+            f.write("\n".join(lines))
 
 
 def reset_cfg(cfg, args):
@@ -174,9 +185,9 @@ def extend_cfg(cfg):
     # 数据集和数据加载配置
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"         # 子采样策略：all/base/new
     cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256  # 嵌入bank的batch大小
-    cfg.DATASET.TRAIN_EPS = 20                    # 训练扰动强度（16/255 ≈ 0.063）
+    cfg.DATASET.TRAIN_EPS = 16                    # 训练扰动强度（16/255 ≈ 0.063）
     cfg.DATASET.TEST_EPS = 16                     # 测试扰动强度（16/255 ≈ 0.063）
-    cfg.DATASET.Train_PGD_NUM_ITERS = 60                # PGD攻击迭代次数（训练和测试统一）
+    cfg.DATASET.Train_PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
     cfg.DATASET.Test_PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
 
     cfg.MODEL.FILE_PREFIX = "model"               # 模型文件名前缀
@@ -242,7 +253,7 @@ def main(args):
         os.makedirs(args.path)
     
     # 调试信息（已注释）
-    # print_args(args, cfg)
+    print_args(args, cfg)
     # print("Collecting env info ...")
     # print("** System info **\n{}\n".format(collect_env_info()))
 

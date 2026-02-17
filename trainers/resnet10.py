@@ -12,8 +12,6 @@ from dass.engine import TRAINER_REGISTRY, TrainerX
 from dass.metrics import compute_accuracy
 from dass.utils import load_pretrained_weights, load_checkpoint
 from dass.optim import build_optimizer, build_lr_scheduler
-from torchdiffeq import odeint_adjoint
-from torchdiffeq import odeint
 from utils.adv_utils import ImageNormalizer, get_model
 
 from clip import clip
@@ -22,8 +20,8 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 
 # ============================================================================
-# ODE-Prompt: 连续时间对抗提示学习
-# 核心思想: dp(t)/dt = f_θ(p(t), z_v)，其中 z_v 是对抗图像的视觉特征
+# ResNet10-Prompt: 基于 ResNet-10 的对抗提示学习
+# 核心思想: p(T) = p(0) + ResNet10_θ([p(0); z_v])，其中 z_v 是对抗图像的视觉特征
 # ============================================================================
 
 
@@ -48,7 +46,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning/clip')
+    model_path = clip._download(url, '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/clip')
 
     try:
         # loading JIT archive
@@ -86,132 +84,110 @@ class TextEncoder(nn.Module):
         return x
 
 
-class ODEFunc(nn.Module):
+class ResidualBlock(nn.Module):
+    """ResNet 基本残差块 (1D 版本)"""
+    def __init__(self, dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.block(x))
+
+
+class PromptResNet10(nn.Module):
     """
-    ODE 动力学网络 f_θ
+    ResNet-10 提示变换网络 f_θ
     
-    根据论文公式 (3.2):
-        dp(t)/dt = f_θ(p(t), z_v)
+    公式:
+        p(T) = p(0) + f_θ([p(0); z_v])
     
     其中:
-        - p(t): 当前时刻的提示状态，形状 (n_ctx, dim)
+        - p(0): 初始提示状态，形状 (n_ctx, dim)
         - z_v: 对抗图像的视觉特征，形状 (batch_size, dim)
-        
-    网络设计:
-        f_θ(p, z_v) = MLP_θ([p; z_v])  # 论文公式
-        
-    为了处理 batch 维度的不匹配，我们采用以下策略:
-        - 在训练时，z_v 的 batch 均值作为全局视觉条件
-        - 这样 ODE 为所有类别生成统一的提示演化
+    
+    网络结构 (10 层):
+        - 1 个输入投影层
+        - 4 个残差块 (每块 2 层，共 8 层)
+        - 1 个输出投影层
     """
     def __init__(self, prompt_dim, visual_dim):
-        super(ODEFunc, self).__init__()
+        super(PromptResNet10, self).__init__()
         self.prompt_dim = prompt_dim
         self.visual_dim = visual_dim
         
-        # 视觉特征会被存储在这里，供 forward 使用
-        # 这是因为 odeint 只允许 forward(t, x) 签名
-        self.z_v = None  
-        
-        # 主网络: 使用 Residual MLP 替代简单的 MLP
-        # 增加网络容量，有助于学习更复杂的动力学
-        #self.hidden_dim = 768
         self.hidden_dim = prompt_dim * 2
         
+        # 输入投影 (第 1 层)
         self.input_proj = nn.Linear(prompt_dim + visual_dim, self.hidden_dim)
-        # self.norm_in = nn.LayerNorm(self.hidden_dim)
+        self.input_norm = nn.LayerNorm(self.hidden_dim)
         self.act = nn.GELU()
-
-        self.mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
+        
+        # 4 个残差块 (第 2~9 层, 每块 2 层)
+        self.res_blocks = nn.Sequential(
+            ResidualBlock(self.hidden_dim),
+            ResidualBlock(self.hidden_dim),
+            ResidualBlock(self.hidden_dim),
+            ResidualBlock(self.hidden_dim),
         )
         
-        self.res_blocks = nn.ModuleList()
-        for _ in range(2):  # 2 个残差块
-            block = nn.Sequential(
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU()
-            )
-            # 关键修复：零初始化残差块的最后一层，确保初始时残差接近零
-            #nn.init.zeros_(block[3].weight)
-            #nn.init.zeros_(block[3].bias)
-            self.res_blocks.append(block)
-        
-        # 输出投影
+        # 输出投影 (第 10 层)
         self.output_proj = nn.Linear(self.hidden_dim, prompt_dim)
         
-        # 关键修复：使用极小的高斯初始化而不是全零
-        # 全零会导致 res_blocks 在初期梯度为0（梯度阻断）
-        # 极小值 (1e-5) 既能保证 ODE 初始接近恒等，又能打通梯度
+        # 零初始化输出层，使初始时网络输出接近零（残差连接保持 p(0)）
         nn.init.zeros_(self.output_proj.weight)
-        # nn.init.normal_(self.output_proj.weight, std=1e-5)
         nn.init.zeros_(self.output_proj.bias)
-    
-    def set_visual_feature(self, z_v):
-        """
-        设置视觉特征条件
-        
-        参数:
-            z_v: 对抗图像嵌入，形状 (batch_size, visual_dim)
-        """
-        # 移除 batch 均值，保留每个样本的独立特征
-        self.z_v = z_v  # (batch_size, visual_dim)
 
-    def forward(self, t, p):
+    def forward(self, p, z_v):
         """
-        计算 ODE 导数 dp/dt = f_θ(p, z_v)
+        ResNet-10 前向传播: p(T) = p(0) + f_θ([p(0); z_v])
         
         参数:
-            t: 当前时间点 (标量，ODE 求解器需要，但我们的动力学是时间无关的)
-            p: 当前提示状态，形状 (batch_size, n_ctx, prompt_dim)
+            p: 初始提示状态，形状 (batch_size, n_ctx, prompt_dim)
+            z_v: 视觉特征，形状 (batch_size, visual_dim)
         
         返回:
-            dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
+            p_out: 变换后的提示，形状 (batch_size, n_ctx, prompt_dim)
         """
-        if self.z_v is None:
-            raise RuntimeError("必须先调用 set_visual_feature() 设置视觉特征！")
-        
-        # p 的形状: (batch_size, n_ctx, prompt_dim)
-        # z_v 的形状: (batch_size, visual_dim)
-        
         # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
         # 扩展后形状: (batch_size, n_ctx, visual_dim)
-        z_v_expanded = self.z_v.unsqueeze(1).expand(-1, p.shape[1], -1)
+        z_v_expanded = z_v.unsqueeze(1).expand(-1, p.shape[1], -1)
         
-        # 拼接: [p(t); z_v]
+        # 拼接: [p(0); z_v]
         # 形状: (batch_size, n_ctx, prompt_dim + visual_dim)
         inp = torch.cat([p, z_v_expanded], dim=-1)
         
-        # Residual MLP 前向传播
+        # ResNet-10 前向传播
         x = self.input_proj(inp)
-        x = self.act(x) 
-        #x = self.mlp(x)
-        for block in self.res_blocks:
-            x = x + block(x)
+        x = self.input_norm(x)
+        x = self.act(x)
+        x = self.res_blocks(x)
         
-        # 输出层
-        dp_dt = self.output_proj(x)
+        # 输出层 + 残差连接
+        delta = self.output_proj(x)
+        p_out = p + delta
         
-        return dp_dt
+        return p_out
 
 
 class PromptLearner(nn.Module):
     """
-    ODE-Prompt 的提示学习器
+    ResNet10-Prompt 的提示学习器
     
     核心改变:
         - 原始 AdvPT: ctx 是可学习参数，直接用于 prompt
-        - ODE-Prompt: ctx 作为固定初始状态 p(0)，通过 ODE 演化得到 p(T)
+        - ResNet10-Prompt: ctx 作为固定初始状态 p(0)，通过 ResNet-10 变换得到 p(T)
     
     流程:
         1. p(0) = "a photo of a" 的文本嵌入 (固定)
-        2. 设置视觉特征 z_v = E_v(x_adv)
-        3. ODE 求解: p(T) = ODEsolve(f_θ, p(0), [0, T])
+        2. 获取视觉特征 z_v = E_v(x_adv)
+        3. ResNet-10 变换: p(T) = p(0) + ResNet10_θ([p(0); z_v])
         4. 拼接: [SOS, p(T), class_name, EOS]
     """
     def __init__(self, cfg, classnames, clip_model):
@@ -256,9 +232,9 @@ class PromptLearner(nn.Module):
         #     nn.init.normal_(ctx_vectors, std=0.02)
         #     prompt_prefix = "<random_init>"
 
-        print(f'[ODE-Prompt] Initial prompt p(0): "{prompt_prefix}"')
-        print(f"[ODE-Prompt] Number of context tokens: {n_ctx}")
-        print(f"[ODE-Prompt] Prompt dimension: {ctx_dim}, Visual dimension: {visual_dim}")
+        print(f'[ResNet10-Prompt] Initial prompt p(0): "{prompt_prefix}"')
+        print(f"[ResNet10-Prompt] Number of context tokens: {n_ctx}")
+        print(f"[ResNet10-Prompt] Prompt dimension: {ctx_dim}, Visual dimension: {visual_dim}")
 
         # =========================================================
         # p(0) 作为固定的 buffer，不参与梯度更新
@@ -267,14 +243,9 @@ class PromptLearner(nn.Module):
         self.register_buffer("p0", ctx_vectors)  # 固定初始状态
         
         # =========================================================
-        # ODE 动力学网络 f_θ (这是唯一的可学习部分!)
-        # 关键修复：ODE 网络必须使用 float32 以保证数值稳定性
-        # torchdiffeq 在 fp16 下会出现严重的数值问题
+        # ResNet-10 变换网络 f_θ (这是唯一的可学习部分!)
         # =========================================================
-        self.ode_func = ODEFunc(ctx_dim, visual_dim).float()  # 强制 float32
-        
-        # ODE 求解器参数
-        self.ode_t = torch.tensor([0.0, 1.0])  # 时间范围 [0, T]，T=1
+        self.resnet_func = PromptResNet10(ctx_dim, visual_dim).float()
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -299,7 +270,7 @@ class PromptLearner(nn.Module):
 
     def forward(self, z_v):
         """
-        ODE-Prompt 的前向传播
+        ResNet10-Prompt 的前向传播
         
         参数:
             z_v: 对抗图像的视觉特征，形状 (batch_size, visual_dim)
@@ -309,8 +280,8 @@ class PromptLearner(nn.Module):
             prompts: 完整的提示嵌入，形状 (batch_size, n_cls, seq_len, dim)
         
         流程:
-            1. 设置视觉特征到 ODE 网络
-            2. 求解 ODE: p(T) = ODEsolve(f_θ, p(0), [0,1])
+            1. 获取初始提示 p(0)
+            2. ResNet-10 变换: p(T) = p(0) + ResNet10_θ([p(0); z_v])
             3. 拼接 prompt: [SOS, p(T), class_name, EOS]
         """
         # =========================================================
@@ -319,44 +290,20 @@ class PromptLearner(nn.Module):
         bs = z_v.shape[0]
         
         # =========================================================
-        # Step 2: ODE 求解 - 核心步骤!
+        # Step 2: ResNet-10 变换 - 核心步骤!
         # =========================================================
         # 初始状态: p(0) = "a photo of a" 的嵌入
         # 形状: (n_ctx, prompt_dim) -> (batch_size, n_ctx, prompt_dim)
         p0 = self.p0.unsqueeze(0).expand(bs, -1, -1)
         
-        # 时间点: [0, 1]  -> 表示从 t=0 演化到 t=1
-        t = self.ode_t.to(p0.device)
-        
-        # 求解 ODE:
-        # p(T) = p(0) + ∫_0^T f_θ(p(t), z_v) dt
-        # 
-        # odeint 返回形状: (len(t), batch_size, n_ctx, prompt_dim)
-        # 我们取 [1] 即 t=1 时刻的状态
-        # 关键修复：将输入转换为 float32 以匹配 ODE 网络
-        # ODE 求解过程在 float32 下进行，之后再转回原始 dtype
+        # 将输入转换为 float32 以匹配 ResNet-10 网络
         p0_float = p0.float()
         z_v_float = z_v.float()
-        self.ode_func.set_visual_feature(z_v_float)  # 重新设置为 float32 版本
         
-        # 使用普通 odeint 而非 adjoint 版本
-        # adjoint 在反向传播时需要重新求解 ODE，数值上更不稳定
-        # 普通 odeint 直接通过计算图反向传播，更稳定
-        p_trajectory = odeint_adjoint(
-            self.ode_func,      # 导数函数 dp/dt = f_θ(p, z_v)
-            p0_float,           # 初始状态 p(0)，float32
-            t,                  # 时间点 [0, 1]
-            method='dopri5',    # Dormand-Prince 5 (自适应步长)
-            rtol=1e-3,          # 放宽容差以提高数值稳定性
-            atol=1e-4,          
-            options={'min_step': 1e-5}  # 适当的最小步长
-        )
+        # ResNet-10 变换: p(T) = p(0) + ResNet10_θ([p(0); z_v])
+        ctx = self.resnet_func(p0_float, z_v_float)
         
-        # 取终端状态 p(T)
-        # 形状: (batch_size, n_ctx, prompt_dim)
-        ctx = p_trajectory[1]  # t=1 时刻的状态
-        
-        # 关键修复：将 ODE 输出转回原始 dtype (与 prefix/suffix 匹配)
+        # 将输出转回原始 dtype (与 prefix/suffix 匹配)
         ctx = ctx.type(self.p0.dtype)
         
         # =========================================================
@@ -434,15 +381,15 @@ class PromptLearner(nn.Module):
 
 class CustomCLIP(nn.Module):
     """
-    ODE-Prompt 的自定义 CLIP 模型
+    ResNet10-Prompt 的自定义 CLIP 模型
     
     组件:
-        - prompt_learner: ODE-Prompt 提示学习器
+        - prompt_learner: ResNet10-Prompt 提示学习器
         - image_encoder: 冻结的 CLIP 图像编码器
         - text_encoder: 冻结的 CLIP 文本编码器
     
     可学习部分:
-        - 仅 prompt_learner.ode_func (即 ODE 动力学网络 f_θ)
+        - 仅 prompt_learner.resnet_func (即 ResNet-10 变换网络 f_θ)
     """
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
@@ -459,14 +406,14 @@ class CustomCLIP(nn.Module):
         
         流程:
             1. 编码图像 -> 视觉特征
-            2. ODE 演化提示 (z_v 作为条件)
+            2. ResNet-10 变换提示 (z_v 作为条件)
             3. 编码提示 -> 文本特征
             4. 计算相似度
         """
         # Step 1: 编码图像
         image_features = self.image_encoder(image.type(self.dtype))
         
-        # Step 2: ODE 演化提示
+        # Step 2: ResNet-10 变换提示
         # 注意: 这里使用干净图像的特征作为 z_v
         # 在训练时，会使用 forward_embedding 传入对抗特征
         prompts = self.prompt_learner(image_features) # (bs, n_cls, seq_len, dim)
@@ -480,20 +427,6 @@ class CustomCLIP(nn.Module):
         tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
         
         text_features = self.text_encoder(prompts_flat, tokenized_prompts_flat) # (bs*n_cls, dim)
-
-        # CHUNK_SIZE = 512
-        # text_features_list = []
-        # total_size = prompts_flat.shape[0]
-        
-        # for i in range(0, total_size, CHUNK_SIZE):
-        #     end_idx = min(i + CHUNK_SIZE, total_size)
-        #     chunk_prompts = prompts_flat[i:end_idx]
-        #     chunk_tokenized = tokenized_prompts_flat[i:end_idx]
-            
-        #     chunk_features = self.text_encoder(chunk_prompts, chunk_tokenized)
-        #     text_features_list.append(chunk_features)
-            
-        # text_features = torch.cat(text_features_list, dim=0) # (bs*n_cls, dim)
         text_features = text_features.view(bs, n_cls, -1) # (bs, n_cls, dim)
 
         # Step 4: 归一化并计算相似度
@@ -512,7 +445,7 @@ class CustomCLIP(nn.Module):
         """
         使用预存的对抗嵌入进行训练 (来自 Embedding Bank)
         
-        这是 ODE-Prompt 训练的核心方法!
+        这是 ResNet10-Prompt 训练的核心方法!
         
         参数:
             image_features: 对抗图像嵌入，形状 (batch_size, visual_dim)
@@ -522,8 +455,8 @@ class CustomCLIP(nn.Module):
             logits: 预测分数，形状 (batch_size, n_cls)
         
         流程:
-            1. 将对抗嵌入 z_v 传给 ODE 网络
-            2. ODE 演化: p(T) = ODEsolve(f_θ, p(0), [0,1])
+            1. 将对抗嵌入 z_v 传给 ResNet-10 网络
+            2. ResNet-10 变换: p(T) = p(0) + ResNet10_θ([p(0); z_v])
             3. 编码提示 -> 文本特征
             4. 计算对抗嵌入与文本特征的相似度
         """
@@ -531,7 +464,7 @@ class CustomCLIP(nn.Module):
         image_features = image_features.type(self.dtype)
         
         # =========================================================
-        # 核心: 将对抗图像嵌入传给 PromptLearner
+        # 核心: 将对抗图像嵌入传给 PromptLearner (ResNet-10 变换)
         # 这里 z_v = image_features 来自 Embedding Bank
         # =========================================================
         prompts = self.prompt_learner(image_features)  # (bs, n_cls, seq_len, dim)
@@ -544,23 +477,6 @@ class CustomCLIP(nn.Module):
         tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
         
         text_features = self.text_encoder(prompts_flat, tokenized_prompts_flat) # (bs*n_cls, dim)
-
-        # Chunked processing to avoid OOM
-        # Default chunk size of 512, can be adjusted
-        # CHUNK_SIZE = 512
-        # text_features_list = []
-        # total_size = prompts_flat.shape[0]
-        
-        # for i in range(0, total_size, CHUNK_SIZE):
-        #     end_idx = min(i + CHUNK_SIZE, total_size)
-        #     chunk_prompts = prompts_flat[i:end_idx]
-        #     chunk_tokenized = tokenized_prompts_flat[i:end_idx]
-            
-        #     chunk_features = self.text_encoder(chunk_prompts, chunk_tokenized)
-        #     text_features_list.append(chunk_features)
-            
-        # text_features = torch.cat(text_features_list, dim=0) # (bs*n_cls, dim)
-
         text_features = text_features.view(bs, n_cls, -1) # (bs, n_cls, dim)
 
         # 归一化
@@ -576,18 +492,18 @@ class CustomCLIP(nn.Module):
 
 
 @TRAINER_REGISTRY.register()
-class AdvPT(TrainerX):
+class resnet10(TrainerX):
 
     def check_cfg(self, cfg):
         assert cfg.TRAINER.ADV.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         """
-        构建 ODE-Prompt 模型
+        构建 ResNet10-Prompt 模型
         
         核心组件:
-            - CustomCLIP: 包含 PromptLearner (ODE-Prompt)
-            - PromptLearner 中的 ode_func 是唯一可学习的部分
+            - CustomCLIP: 包含 PromptLearner (ResNet10-Prompt)
+            - PromptLearner 中的 resnet_func 是唯一可学习的部分
         
         冻结部分:
             - CLIP 图像编码器
@@ -604,13 +520,13 @@ class AdvPT(TrainerX):
             # CLIP's default precision is fp16
             clip_model.float()
 
-        print("Building ODE-Prompt CustomCLIP")
+        print("Building ResNet10-Prompt CustomCLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
 
         # =========================================================
-        # 只允许 prompt_learner 中的 ODE 网络进行梯度更新
+        # 只允许 prompt_learner 中的 ResNet-10 网络进行梯度更新
         # =========================================================
-        print("[ODE-Prompt] Turning off gradients in image/text encoders")
+        print("[ResNet10-Prompt] Turning off gradients in image/text encoders")
         for name, param in self.model.named_parameters():
             if "prompt_learner" not in name:
                 param.requires_grad_(False)
@@ -622,11 +538,11 @@ class AdvPT(TrainerX):
         # =========================================================
         self.model.image_encoder.eval()
         self.model.text_encoder.eval()
-        print("[ODE-Prompt] Set image_encoder and text_encoder to eval mode (frozen)")
+        print("[ResNet10-Prompt] Set image_encoder and text_encoder to eval mode (frozen)")
         
         # 统计可学习参数
         n_params = sum(p.numel() for p in self.model.prompt_learner.parameters() if p.requires_grad)
-        print(f"[ODE-Prompt] Trainable parameters: {n_params:,} (only ODE network f_θ)")
+        print(f"[ResNet10-Prompt] Trainable parameters: {n_params:,} (only ResNet-10 network f_\u03b8)")
 
         if cfg.MODEL.INIT_WEIGHTS:
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
@@ -1097,8 +1013,8 @@ class AdvPT(TrainerX):
         """
         加载模型权重
         
-        ODE-Prompt 的可学习部分:
-            - ode_func: ODE 动力学网络 f_θ
+        ResNet10-Prompt 的可学习部分:
+            - resnet_func: ResNet-10 变换网络 f_θ
         
         固定部分 (应该忽略):
             - p0: 固定初始状态
@@ -1160,20 +1076,20 @@ class AdvPT(TrainerX):
             self._models[name].load_state_dict(state_dict, strict=False)
             
             # =========================================================
-            # 验证 ODE 网络权重是否正确加载
+            # 验证 ResNet-10 网络权重是否正确加载
             # =========================================================
-            ode_func = self._models[name].ode_func
-            print(f"\n[Verify] ODE network loaded successfully")
-            print(f"[Verify] input_proj weight sum: {ode_func.input_proj.weight.sum().item():.6f}")
-            print(f"[Verify] input_proj bias sum: {ode_func.input_proj.bias.sum().item():.6f}")
-            print(f"[Verify] output_proj weight sum: {ode_func.output_proj.weight.sum().item():.6f}")
-            print(f"[Verify] output_proj bias sum: {ode_func.output_proj.bias.sum().item():.6f}")
+            resnet_func = self._models[name].resnet_func
+            print(f"\n[Verify] ResNet-10 network loaded successfully")
+            print(f"[Verify] input_proj weight sum: {resnet_func.input_proj.weight.sum().item():.6f}")
+            print(f"[Verify] input_proj bias sum: {resnet_func.input_proj.bias.sum().item():.6f}")
+            print(f"[Verify] output_proj weight sum: {resnet_func.output_proj.weight.sum().item():.6f}")
+            print(f"[Verify] output_proj bias sum: {resnet_func.output_proj.bias.sum().item():.6f}")
             
-            # 检查是否所有 ODE 相关的键都被加载
-            ode_keys = [k for k in state_dict.keys() if 'ode_func' in k]
-            print(f"[Verify] Loaded {len(ode_keys)} ODE-related keys from checkpoint")
+            # 检查是否所有 ResNet-10 相关的键都被加载
+            resnet_keys = [k for k in state_dict.keys() if 'resnet_func' in k]
+            print(f"[Verify] Loaded {len(resnet_keys)} ResNet-10-related keys from checkpoint")
             
-            # 详细列出 ODE 网络的各层权重统计
-            print("[Verify] ODE network layer statistics:")
-            for layer_name, param in ode_func.named_parameters():
+            # 详细列出 ResNet-10 网络的各层权重统计
+            print("[Verify] ResNet-10 network layer statistics:")
+            for layer_name, param in resnet_func.named_parameters():
                 print(f"  - {layer_name}: shape={list(param.shape)}, mean={param.mean().item():.6f}, std={param.std().item():.6f}")
