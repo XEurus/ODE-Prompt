@@ -3,7 +3,7 @@
 ROOT="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data"
 TRAINER=AdvPT
 # oxford_flowers, oxford_pets, imagenet, food101, sun397, dtd, eurosat, ucf101
-DATASET=ucf101
+DATASET=oxford_pets
 # rn50, vit_b16, vit_l14
 CFG=vit_b16 # config file
 CTP=end  # class token position (end or middle)
@@ -14,10 +14,10 @@ MODEL_FILE=resnet_model.pth.tar
 Best_Model=resnet_model-best.pth.tar
 D=$ROOT
 SEED=1
-exp_name="5_PGD40_16_mix6_sgd_1e3_60"
+exp_name="6_PGD40_16_mix64_sgd_1e3_3"
 
 DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/${exp_name}
-
+TENSORBOARD_DIR= "./output/${DATASET}/${TRAINER}/${CFG}/adv/TensorBoard"
 PYTHON="./dassl/bin/python"
 echo "--------------------------------------------------------------------------------------"
 
@@ -37,7 +37,8 @@ $PYTHON train.py \
 --model-file ${MODEL_FILE} \
 TRAINER.ADV.N_CTX ${NCTX} \
 TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
-TRAINER.ADV.CSC ${CSC} 2>&1 | tee ${LOG_FILE}
+TRAINER.ADV.CSC ${CSC} \
+TRAIN.TENSORBOARD_DIR "${TENSORBOARD_DIR}" 2>&1 | tee ${LOG_FILE}
 
 # 查找最新的带时间戳的日志文件，如果没有则使用 log.txt
 LATEST_LOG=$(ls -t ${DIR}/log.txt-* 2>/dev/null | head -n 1)

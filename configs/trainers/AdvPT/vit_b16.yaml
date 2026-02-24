@@ -1,7 +1,7 @@
 DATALOADER:
   TRAIN_X:
-    BATCH_SIZE: 32
-    BATCH_EMBEDDING_SIZE: 32
+    BATCH_SIZE: 8 
+    BATCH_EMBEDDING_SIZE: 8
   TEST:
     BATCH_SIZE: 32
   NUM_WORKERS: 16
@@ -13,14 +13,14 @@ INPUT:
   PIXEL_STD: [0.26862954, 0.26130258, 0.27577711]
   TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]
 
-OPTIM:
-  NAME: "sgd"
-  LR: 0.0001
-  MAX_EPOCH: 80
-  LR_SCHEDULER: "cosine"
-  WARMUP_EPOCH: 3
-  WARMUP_TYPE: "constant"
-  WARMUP_CONS_LR: 1e-5
+# OPTIM:
+#   NAME: "sgd"
+#   LR: 0.0001
+#   MAX_EPOCH: 100
+#   LR_SCHEDULER: "cosine"
+#   WARMUP_EPOCH: 5
+#   WARMUP_TYPE: "constant"
+#   WARMUP_CONS_LR: 5e-5
 # OPTIM:
 #   NAME: "sgd"
 #   LR: 0.0001
@@ -33,28 +33,30 @@ OPTIM:
 #   PLATEAU_MIN_LR: 1e-6
 #   WARMUP_EPOCH: -1  # plateau 不支持 warmup
 
-# OPTIM: # 48.8
-#   NAME: "adamw"
-#   LR: 0.0005
-#   MAX_EPOCH: 40
-#   LR_SCHEDULER: "plateau"
-#   PLATEAU_MODE: "min"
-#   PLATEAU_FACTOR: 0.1
-#   PLATEAU_PATIENCE: 4
-#   PLATEAU_THRESHOLD: 1e-4
-#   PLATEAU_MIN_LR: 1e-7
-#   WARMUP_EPOCH: -1  # plateau 不支持 warmup
+OPTIM: # 48.8
+  NAME: "adamw"
+  LR: 0.0001
+  MAX_EPOCH: 80
+  LR_SCHEDULER: "plateau"
+  PLATEAU_MODE: "min"
+  PLATEAU_FACTOR: 0.1
+  PLATEAU_PATIENCE: 4
+  PLATEAU_THRESHOLD: 1e-4
+  PLATEAU_MIN_LR: 1e-7
+  WARMUP_EPOCH: -1  # plateau 不支持 warmup
 
 TRAIN:
   PRINT_FREQ: 5
-  CHECKPOINT_FREQ: 10  # 每10个epoch保存一次检查点
-  MIX_CLEAN_RATIO: 0.3  # 干净数据混合比例 (0.0=纯对抗, 1.0=纯干净, 0.5=各50%)
+  CHECKPOINT_FREQ: 5  # 每10个epoch保存一次检查点
+  MIX_CLEAN_RATIO: 0.0 # 干净数据混合比例 (0.0=纯对抗, 1.0=纯干净, 0.5=各50%)
+  # TENSORBOARD_DIR: "/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/output/ucf101/AdvPT/vit_b16"
 
 TEST:
   NO_TEST: False
   FINAL_MODEL: "best_val"  # 启用每个epoch的测试
   SPLIT: "test"
-  EPOCH_TEST_BATCHES: 10  # 每个epoch测试的batch数量
+  EPOCH_TEST_BATCHES: 0  # val/train评估batch数量，0表示全量
+  PARTIAL_TEST_BATCHES: 10  # 每个epoch额外测试test前10个batch
 
 MODEL:
   BACKBONE:

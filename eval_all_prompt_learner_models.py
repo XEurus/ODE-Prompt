@@ -177,11 +177,14 @@ def main():
         try:
             trainer.load_model(model_dir, model_file=model_file)
 
-            # clean/test 评估入口严格对齐 train.py eval_only 逻辑
+            print("[1/5] Evaluating: test set (clean images - standard clean accuracy)")
             clean_acc = float(trainer.test())
+            
+            print("[2/5] Evaluating: test set (adversarial PGD images - robust accuracy)")
             test_acc = float(trainer.test_adv(split="test"))
 
             # train/val 使用预计算 embedding 完整评估（all batches）
+            print("[3/5] Evaluating: train set (adversarial embeddings from _v2.pkl)")
             train_acc = eval_adv_embedding_full(
                 trainer,
                 trainer.train_pkl,
@@ -191,9 +194,13 @@ def main():
 
             val_acc = ""
             if trainer.val_loader is not None and getattr(trainer, "val_pkl", None) is not None:
+                print("[4/5] Evaluating: val set (adversarial embeddings from _val_v2.pkl)")
                 val_acc = f"{eval_adv_embedding_full(trainer, trainer.val_pkl, trainer.val_loader, split_name='val'):.4f}"
+            else:
+                print("[4/5] Skipping: val set (no val_loader or val_pkl available)")
 
             # clean.pkl（训练集 clean embedding）完整评估
+            print("[5/5] Evaluating: train set (clean embeddings from _clean.pkl)")
             clean_train_embed_acc = eval_adv_embedding_full(
                 trainer,
                 trainer.clean_pkl,
@@ -208,9 +215,12 @@ def main():
             row["clean_train_embedding_accuracy"] = f"{clean_train_embed_acc:.4f}"
 
             print(
-                f"[Done] {model_file} | clean={row['clean_accuracy']} | test={row['test_accuracy']} "
-                f"| train={row['train_accuracy']} | val={row['val_accuracy'] or 'N/A'} "
-                f"| clean_train_emb={row['clean_train_embedding_accuracy']}"
+                f"\n[Done] {model_file} | Results Summary:\n"
+                f"  - test (clean):       {row['clean_accuracy']}%\n"
+                f"  - test (PGD adv):     {row['test_accuracy']}%\n"
+                f"  - train (adv embed):  {row['train_accuracy']}%\n"
+                f"  - val (adv embed):    {row['val_accuracy'] or 'N/A'}%\n"
+                f"  - train (clean embed): {row['clean_train_embedding_accuracy']}%"
             )
         except Exception as exc:
             row["status"] = "error"

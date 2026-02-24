@@ -635,17 +635,26 @@ class AdvPT(TrainerX):
         batch, embedding_adv = batch_dict['batch'], batch_dict['images_adv']
         label = batch["label"].to(self.device)
 
-        output = self.model.forward_embedding(embedding_adv)
-        loss_adv = torch.nn.CrossEntropyLoss()(output, label)
-        loss = loss_adv
-        # self.model_backward_and_update(loss) 原有更新方式
+        # 计算对抗损失的嵌入
+        output_adv = self.model.forward_embedding(embedding_adv)
+        loss_adv = torch.nn.CrossEntropyLoss()(output_adv, label)
+
+        # 计算与干净图像的损失（如果clean_pkl可用）
+        #if 'images_clean' in batch_dict and batch_dict['images_clean'] is not None:
+        embedding_clean = batch_dict['images_clean'].to(self.device)
+        output_clean = self.model.forward_embedding(embedding_clean)
+        loss_clean = torch.nn.CrossEntropyLoss()(output_clean, label)
+        # 1:1 比例混合
+        loss = 0.4 * loss_adv + 0.6 * loss_clean
+        # else:
+        #     loss = loss_adv
 
         # 非有限 loss 直接跳过更新，避免训练中断
-        if not torch.isfinite(loss):
+        if not torch.isfinite(loss_clean):
             print("[WARN] Non-finite loss detected; skip update for this batch")
             loss_summary = {
                 "loss": loss.item(),
-                "acc": compute_accuracy(output, label)[0].item(),
+                "acc": compute_accuracy(output_adv, label)[0].item(),
             }
             return loss_summary
 
@@ -663,7 +672,7 @@ class AdvPT(TrainerX):
 
         loss_summary = {
             "loss": loss.item(),
-            "acc": compute_accuracy(output, label)[0].item(),
+            "acc": compute_accuracy(output_adv, label)[0].item(),
         }
 
         if (self.batch_idx + 1) == self.num_batches:
@@ -805,7 +814,7 @@ class AdvPT(TrainerX):
             self.write_scalar("epoch/test_partial_adv_acc", test_partial_acc, self.epoch)
         if val_acc is not None and test_partial_acc is not None:
             gap = val_acc - test_partial_acc
-            self.write_scalar("epoch/val_test_gap", gap, self.epoch)
+            #self.write_scalar("epoch/val_test_gap", gap, self.epoch)
             self.write_scalar("epoch/val_test_gap_abs", abs(gap), self.epoch)
 
         # 统一打印一行结构化指标，便于日志解析/画图

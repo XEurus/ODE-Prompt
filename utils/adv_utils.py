@@ -195,7 +195,7 @@ def get_model(model):
     return model
 
 
-def create_pgd_attacker(eps, normalizer, cfg=None, num_iters=None):
+def create_pgd_attacker(eps, normalizer, cfg=None, num_iters=None, num_restarts=None):
     """
     创建 PGD 攻击器
     
@@ -204,6 +204,7 @@ def create_pgd_attacker(eps, normalizer, cfg=None, num_iters=None):
         normalizer: ImageNormalizer 实例
         cfg: 配置对象，用于读取 PGD_NUM_ITERS
         num_iters: 迭代次数（如果指定，则覆盖 cfg 中的值）
+        num_restarts: 随机初始化次数
     
     返回:
         PGD 攻击器实例
@@ -220,7 +221,8 @@ def create_pgd_attacker(eps, normalizer, cfg=None, num_iters=None):
     return PGD(
         eps / 255., 
         preprocess=normalizer.get_transform(), 
-        num_iters=num_iters
+        num_iters=num_iters,
+        num_restarts=num_restarts
     )
 
 

@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from utils.enumType import NormType
 from utils.util import random_init, clamp_by_l2
 from utils.hook import SingleModelHook
-
+import random
 
 class PGD():
     def __init__(self, epsilon, *args, **kwargs):
@@ -14,6 +14,7 @@ class PGD():
         self.norm_type = kwargs.get('norm_type', NormType.Linf)
         self.preprocess = kwargs.get('preprocess', lambda x: x)
         self.bounding = kwargs.get('bounding', (0, 1))
+        self.num_restarts = kwargs.get('num_restarts', 1)
 
 
     def run(self, net, image, target=None, scaler=1, feature_layer='fc', *args):
@@ -35,22 +36,42 @@ class PGD():
             else:
                 raise ('Error when init clean embedding')
 
-        iteration = self.attack(image)
+        best_adv = None
+        best_loss = float('-inf')
+        all_adv_samples = []  # 收集所有重启的对抗样本
 
-        for i in range(self.num_iters):
+        for restart in range(self.num_restarts):
+            iteration = self.attack(image)
+
+            for i in range(self.num_iters):
+                image_adv = next(iteration)
+                net(image_adv)
+
+                loss = criterion(hook.get_hooked_value().log_softmax(dim=-1), clean_embeddings.softmax(dim=-1))
+                loss = loss * scaler
+
+                loss.backward()
+                hook.clear()
+
             image_adv = next(iteration)
-            net(image_adv)
 
-            loss = criterion(hook.get_hooked_value().log_softmax(dim=-1), clean_embeddings.softmax(dim=-1))
-            loss = loss * scaler
+            with torch.no_grad():
+                net(self.preprocess(image_adv))
+                final_loss = criterion(hook.get_hooked_value().log_softmax(dim=-1), clean_embeddings.softmax(dim=-1))
+                hook.clear()
 
-            loss.backward()
-            hook.clear()
+            # 收集当前重启的对抗样本
+            all_adv_samples.append(image_adv.clone())
 
         hook.remove()
         image_adv = next(iteration)
         return image_adv
-
+        # # 从所有重启中随机选择一个
+        # if len(all_adv_samples) > 0:
+        #     selected_idx = random.randint(0, len(all_adv_samples) - 1)
+        #     return all_adv_samples[selected_idx]
+        # else:
+        #     return None
     def input_diversity(self, image):
         return image
 
