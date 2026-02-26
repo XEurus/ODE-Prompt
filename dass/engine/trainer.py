@@ -526,7 +526,7 @@ class SimpleTrainer(TrainerBase):
             self.write_scalar("hparams/optim_lr", float(self.cfg.OPTIM.LR), 0)
             self.write_scalar("hparams/optim_max_epoch", float(self.cfg.OPTIM.MAX_EPOCH), 0)
             self.write_scalar("hparams/train_batch_size", float(self.cfg.DATALOADER.TRAIN_X.BATCH_SIZE), 0)
-            self.write_scalar("hparams/mix_clean_ratio", float(getattr(self.cfg.TRAIN, "MIX_CLEAN_RATIO", 0.0)), 0)
+            # self.write_scalar("hparams/mix_clean_ratio", float(getattr(self.cfg.TRAIN, "MIX_CLEAN_RATIO", 0.0)), 0)
             self.write_scalar("hparams/adv_n_ctx", float(getattr(self.cfg.TRAINER.ADV, "N_CTX", 0)), 0)
             self.write_scalar("hparams/epoch_test_batches", float(getattr(self.cfg.TEST, "EPOCH_TEST_BATCHES", -1)), 0)
             self.write_scalar("hparams/partial_test_batches", float(getattr(self.cfg.TEST, "PARTIAL_TEST_BATCHES", 10)), 0)
@@ -1241,8 +1241,9 @@ class TrainerX(SimpleTrainer):
         运行预计算对抗特征的训练epoch。
         这里使用`before_adv_train`中预先生成的对抗样本特征(`self.train_pkl`)。
 
-        训练时始终使用对抗特征；若存在 clean_pkl，则在 loss 中与干净特征
-        计算 1:1 的引导损失（在 forward_backward_adv 中实现）。
+        支持两种混合方式（通过 cfg.TRAINER.ADV.MIX_CLEAN_RATIO 控制）：
+        1. 数据混合: 按概率选择干净或对抗嵌入作为输入
+        2. 损失混合: 使用对抗嵌入训练，同时在loss中混合干净损失
         """
         self.set_model_mode("train")
         losses = MetricMeter()
@@ -1250,6 +1251,10 @@ class TrainerX(SimpleTrainer):
         data_time = AverageMeter()
         self.num_batches = len(self.train_loader_x_noshuffle)
 
+        # 检查是否使用数据混合
+        mix_clean_ratio = getattr(self.cfg.TRAINER.ADV, 'MIX_CLEAN_RATIO', 0.0)
+        use_data_mixing = mix_clean_ratio > 0 and hasattr(self, 'clean_pkl') and self.clean_pkl is not None
+        # 损失混合：只要有 clean_pkl 就使用
         use_clean_guidance = hasattr(self, 'clean_pkl') and self.clean_pkl is not None
 
         seed = torch.random.seed()
@@ -1276,12 +1281,30 @@ class TrainerX(SimpleTrainer):
             
             images_adv = self.train_pkl[start_idx:end_idx]
 
-            images_clean = self.clean_pkl[start_idx:end_idx] if use_clean_guidance else None
-            batch_dict = {
-                'batch': batch,
-                'images_adv': images_adv.to(self.device),
-                'images_clean': images_clean.to(self.device) if images_clean is not None else None
-            }
+            # 数据混合: 按mix_clean_ratio概率随机选择干净或对抗嵌入
+            if use_data_mixing:
+                images_clean = self.clean_pkl[start_idx:end_idx]
+                batch_size = images_adv.shape[0]
+                
+                # 为每个样本随机决定使用干净还是对抗嵌入
+                mix_mask = torch.rand(batch_size) < mix_clean_ratio
+                mix_mask = mix_mask.unsqueeze(1).expand_as(images_adv)
+                
+                # 混合：clean * mask + adv * (1 - mask)
+                images_mixed = torch.where(mix_mask, images_clean, images_adv)
+                batch_dict = {
+                    'batch': batch, 
+                    'images_adv': images_mixed.to(self.device),
+                    'images_clean': images_clean.to(self.device)  # 保留clean用于损失混合
+                }
+            else:
+                # 无数据混合，使用纯对抗嵌入
+                images_clean = self.clean_pkl[start_idx:end_idx] if use_clean_guidance else None
+                batch_dict = {
+                    'batch': batch,
+                    'images_adv': images_adv.to(self.device),
+                    'images_clean': images_clean.to(self.device) if images_clean is not None else None
+                }
 
             # 进行训练步骤
             loss_summary = self.forward_backward_adv(batch_dict)
@@ -1324,9 +1347,8 @@ class TrainerX(SimpleTrainer):
         self.write_scalar("epoch_train/lr", self.get_current_lr(), self.epoch + 1)
         self.write_scalar("epoch_train/batch_time_avg", batch_time.avg, self.epoch + 1)
         self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
-        # self.write_scalar("epoch_train/mix_clean_ratio", float(mix_clean_ratio), self.epoch + 1)
-        # self.write_scalar("epoch_train/use_mixed", 1.0 if use_mixed else 0.0, self.epoch + 1)
-        self.write_scalar("epoch_train/use_clean_guidance", 1.0 if use_clean_guidance else 0.0, self.epoch + 1)
+        self.write_scalar("epoch_train/mix_clean_ratio", float(mix_clean_ratio), self.epoch + 1)
+        self.write_scalar("epoch_train/use_data_mixing", 1.0 if use_data_mixing else 0.0, self.epoch + 1)
 
     def parse_batch_train(self, batch):
         input = batch["img"]

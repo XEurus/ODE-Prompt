@@ -14,7 +14,7 @@ MODEL_FILE=resnet_model.pth.tar
 Best_Model=resnet_model-best.pth.tar
 D=$ROOT
 SEED=1
-exp_name="6_PGD40_16_mix64_sgd_1e3_3"
+exp_name="6_PGD40_16_mix-loss06_adamw-plateau_1e3"
 
 DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/${exp_name}
 TENSORBOARD_DIR= "./output/${DATASET}/${TRAINER}/${CFG}/adv/TensorBoard"

@@ -199,6 +199,26 @@ class ODEFunc(nn.Module):
         
         return dp_dt
 
+    def forward_ode_network(self, inp):
+        """
+        核心 ODE 网络计算，不含 z_v 处理逻辑
+        
+        参数:
+            inp: 已拼接的输入 [p(t); z_v]，形状 (batch_size, n_ctx, prompt_dim + visual_dim)
+        
+        返回:
+            dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
+        """
+        # Residual MLP 前向传播
+        x = self.input_proj(inp)
+        x = self.act(x)
+        for block in self.res_blocks:
+            x = x + block(x)
+        
+        # 输出层
+        dp_dt = self.output_proj(x)
+        return dp_dt
+
 
 class PromptLearner(nn.Module):
     """
@@ -337,19 +357,30 @@ class PromptLearner(nn.Module):
         # ODE 求解过程在 float32 下进行，之后再转回原始 dtype
         p0_float = p0.float()
         z_v_float = z_v.float()
-        self.ode_func.set_visual_feature(z_v_float)  # 重新设置为 float32 版本
+        # 关键修复：使用闭包捕获 z_v，避免存储在 self.ode_func 中被覆盖
+        # 当使用 loss 混合时，会连续调用两次 forward_embedding，
+        # 如果 z_v 存储在 ode_func 中，第二次调用会覆盖第一次的值，
+        # 导致 adjoint 反向传播时使用了错误的 visual feature
+        z_v_captured = z_v_float
         
-        # 使用普通 odeint 而非 adjoint 版本
-        # adjoint 在反向传播时需要重新求解 ODE，数值上更不稳定
-        # 普通 odeint 直接通过计算图反向传播，更稳定
+        # 创建闭包函数，捕获当前的 z_v
+        def ode_func_closure(t, p):
+            # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
+            z_v_expanded = z_v_captured.unsqueeze(1).expand(-1, p.shape[1], -1)
+            # 拼接: [p(t); z_v]
+            inp = torch.cat([p, z_v_expanded], dim=-1)
+            # 通过 ODE 网络计算 dp/dt
+            return self.ode_func.forward_ode_network(inp)
+        
         p_trajectory = odeint_adjoint(
-            self.ode_func,      # 导数函数 dp/dt = f_θ(p, z_v)
+            ode_func_closure,   # 使用闭包函数，捕获了正确的 z_v
             p0_float,           # 初始状态 p(0)，float32
             t,                  # 时间点 [0, 1]
             method='dopri5',    # Dormand-Prince 5 (自适应步长)
             rtol=1e-3,          # 放宽容差以提高数值稳定性
             atol=1e-4,          
-            options={'min_step': 1e-5}  # 适当的最小步长
+            options={'min_step': 1e-5},  # 适当的最小步长
+            adjoint_params=tuple(self.ode_func.parameters()) # 关键修复：因为闭包不是 nn.Module，必须显式指定需要求导的参数
         )
         
         # 取终端状态 p(T)
@@ -634,23 +665,25 @@ class AdvPT(TrainerX):
     def forward_backward_adv(self, batch_dict):
         batch, embedding_adv = batch_dict['batch'], batch_dict['images_adv']
         label = batch["label"].to(self.device)
+        use_loss_mix = 1
 
         # 计算对抗损失的嵌入
         output_adv = self.model.forward_embedding(embedding_adv)
         loss_adv = torch.nn.CrossEntropyLoss()(output_adv, label)
 
-        # 计算与干净图像的损失（如果clean_pkl可用）
-        #if 'images_clean' in batch_dict and batch_dict['images_clean'] is not None:
-        embedding_clean = batch_dict['images_clean'].to(self.device)
-        output_clean = self.model.forward_embedding(embedding_clean)
-        loss_clean = torch.nn.CrossEntropyLoss()(output_clean, label)
-        # 1:1 比例混合
-        loss = 0.4 * loss_adv + 0.6 * loss_clean
-        # else:
-        #     loss = loss_adv
+        if use_loss_mix:
+            # 计算与干净图像的损失（如果clean_pkl可用）
+            #if 'images_clean' in batch_dict and batch_dict['images_clean'] is not None:
+            embedding_clean = batch_dict['images_clean'].to(self.device)
+            output_clean = self.model.forward_embedding(embedding_clean)
+            loss_clean = torch.nn.CrossEntropyLoss()(output_clean, label)
+            # 1:1 比例混合
+            loss = 0.4 * loss_adv + 0.6 * loss_clean
+        else:
+            loss = loss_adv
 
         # 非有限 loss 直接跳过更新，避免训练中断
-        if not torch.isfinite(loss_clean):
+        if not torch.isfinite(loss):
             print("[WARN] Non-finite loss detected; skip update for this batch")
             loss_summary = {
                 "loss": loss.item(),
