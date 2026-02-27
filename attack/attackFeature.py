@@ -60,13 +60,14 @@ class PGD():
                 final_loss = criterion(hook.get_hooked_value().log_softmax(dim=-1), clean_embeddings.softmax(dim=-1))
                 hook.clear()
 
-            # 收集当前重启的对抗样本
-            all_adv_samples.append(image_adv.clone())
-
+            if final_loss.item() > best_loss:
+                best_loss = final_loss.item()
+                best_adv = image_adv.clone()
+                best_index=restart
         hook.remove()
-        image_adv = next(iteration)
-        return image_adv
-        # # 从所有重启中随机选择一个
+        print("best_index",best_index,"best_loss",best_loss)
+        return best_adv
+                # # 从所有重启中随机选择一个
         # if len(all_adv_samples) > 0:
         #     selected_idx = random.randint(0, len(all_adv_samples) - 1)
         #     return all_adv_samples[selected_idx]

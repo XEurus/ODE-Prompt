@@ -218,6 +218,13 @@ def create_pgd_attacker(eps, normalizer, cfg=None, num_iters=None, num_restarts=
         else:
             num_iters = 40  # 默认值
     
+    # 确定重启次数
+    if num_restarts is None:
+        if cfg and hasattr(cfg.DATASET, 'PGD_NUM_RESTARTS'):
+            num_restarts = cfg.DATASET.PGD_NUM_RESTARTS
+        else:
+            num_restarts = 1  # 默认值
+    
     return PGD(
         eps / 255., 
         preprocess=normalizer.get_transform(), 

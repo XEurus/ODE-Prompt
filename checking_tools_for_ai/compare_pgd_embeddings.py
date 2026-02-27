@@ -1,16 +1,22 @@
 import os
+import sys
+# 添加项目根目录到路径以使用本地clip模块
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+sys.path.insert(0, project_root)
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-from clip import clip
+import clip.clip as clip
 from utils.adv_utils import ImageNormalizer
 
 # Paths
-BASE_DIR = '/home/dji/Project/ODE-Prompt/ODE-Adversarial-Prompt-Tuning'
-PKL_DIR = os.path.join(BASE_DIR, 'pkl_data')
+BASE_DIR = '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning'
+PKL_DIR = os.path.join(BASE_DIR, 'pkl_data_mix')
 CLIP_WEIGHTS = os.path.join(BASE_DIR, 'clip', 'ViT-B-16.pt')
 OUTPUT_PLOT = os.path.join(BASE_DIR, 'distribution_plot_pgd_vs_train_val.png')
 
