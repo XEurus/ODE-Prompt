@@ -375,7 +375,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
     parser.add_argument("--output-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv", help="output directory")
-    parser.add_argument("--path", type=str, default="./pkl_data/", help="directory of pkl")
+    parser.add_argument("--path", type=str, default="./pkl_data_mix_3/", help="directory of pkl")
     
     # 训练控制
     parser.add_argument("--adv-training", action="store_true", default=True, help="启用对抗训练（使用对抗样本增强训练）")

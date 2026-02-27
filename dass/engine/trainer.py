@@ -563,6 +563,7 @@ class SimpleTrainer(TrainerBase):
         # 获取模型组件
         model = get_model(self.model)
         image_encoder = model.image_encoder
+        image_encoder.to(self.device) # 确保 image_encoder 在 GPU 上
         dtype = model.dtype
         
         # 构建代理模型
@@ -585,7 +586,8 @@ class SimpleTrainer(TrainerBase):
         
         # 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
         data_loader = self.train_loader_x_notransform_noshuffle
-        self.train_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
+        # 存储所有 restart 的对抗特征，用于数据增强 [N, num_restarts, dim]
+        self.train_pkl = torch.empty(size=[len(data_loader.dataset), num_restarts, embedding_dim])
         
         # 确保 image_encoder 在 eval 模式
         image_encoder.eval()
@@ -596,19 +598,27 @@ class SimpleTrainer(TrainerBase):
             inputs_pixel = batch['img'].to(self.device)
             
             # PGD 攻击（攻击器内部会归一化后传给网络）
-            # 返回的是像素空间的对抗样本
-            images_adv_pixel = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc')
+            # 设置 return_all=True，返回的是 [bs, num_restarts, C, H, W] 像素空间的对抗样本
+            images_adv_pixel_all = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc', return_all=True)
             
-            # 验证扰动范围
+            # 验证扰动范围 (针对所有样本)
             eps_val = train_eps / 255.
-            assert torch.max(images_adv_pixel - inputs_pixel) < (eps_val + 1e-6)
-            assert torch.min(images_adv_pixel - inputs_pixel) > (-eps_val - 1e-6)
+            diff = images_adv_pixel_all - inputs_pixel.unsqueeze(1)
+            assert torch.max(diff) < (eps_val + 1e-6)
+            assert torch.min(diff) > (-eps_val - 1e-6)
+            
+            # 展平 batch 和 restart 维度以进行归一化和特征提取
+            bs, n_restarts, c, h, w = images_adv_pixel_all.shape
+            images_adv_pixel_flat = images_adv_pixel_all.view(-1, c, h, w)
             
             # 归一化后提取特征
-            images_adv_normalized = normalizer.normalize(images_adv_pixel)
+            images_adv_normalized_flat = normalizer.normalize(images_adv_pixel_flat)
             
             with torch.no_grad():
-                embedding = image_encoder(images_adv_normalized.type(dtype))
+                embedding_flat = image_encoder(images_adv_normalized_flat.type(dtype))
+                
+            # 恢复形状 [bs, num_restarts, dim]
+            embedding = embedding_flat.view(bs, n_restarts, -1)
 
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + embedding.shape[0]
@@ -646,6 +656,7 @@ class SimpleTrainer(TrainerBase):
         
         model = get_model(self.model)
         image_encoder = model.image_encoder
+        image_encoder.to(self.device) # 确保 image_encoder 在 GPU 上
         dtype = model.dtype
         
         embedding_dim = image_encoder.output_dim
@@ -705,6 +716,7 @@ class SimpleTrainer(TrainerBase):
         
         model = get_model(self.model)
         image_encoder = model.image_encoder
+        image_encoder.to(self.device) # 确保 image_encoder 在 GPU 上
         dtype = model.dtype
         
         # 构建代理模型
@@ -1279,11 +1291,23 @@ class TrainerX(SimpleTrainer):
             start_idx = self.batch_idx * self.train_loader_x_noshuffle.batch_size
             end_idx = (self.batch_idx + 1) * self.train_loader_x_noshuffle.batch_size
             
-            images_adv = self.train_pkl[start_idx:end_idx]
+            images_adv = self.train_pkl[start_idx:end_idx] # [bs, num_restarts, dim] or [bs, dim]
+            
+            # 如果 images_adv 是 3D 张量 [bs, num_restarts, dim]，我们需要展开它以利用所有重启样本
+            if images_adv.dim() == 3:
+                bs, num_restarts, dim = images_adv.shape
+                images_adv = images_adv.view(-1, dim) # [bs * num_restarts, dim]
+                # 对应地展开 batch 中的标签，以便损失函数能正确计算
+                # 假设 batch 是一个字典，包含 'label' 和其他键
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].repeat_interleave(num_restarts, dim=0)
 
             # 数据混合: 按mix_clean_ratio概率随机选择干净或对抗嵌入
             if use_data_mixing:
                 images_clean = self.clean_pkl[start_idx:end_idx]
+                if images_adv.shape[0] > images_clean.shape[0]: # 发生了展开
+                    images_clean = images_clean.repeat_interleave(num_restarts, dim=0)
                 batch_size = images_adv.shape[0]
                 
                 # 为每个样本随机决定使用干净还是对抗嵌入
@@ -1300,6 +1324,8 @@ class TrainerX(SimpleTrainer):
             else:
                 # 无数据混合，使用纯对抗嵌入
                 images_clean = self.clean_pkl[start_idx:end_idx] if use_clean_guidance else None
+                if images_clean is not None and images_adv.shape[0] > images_clean.shape[0]:
+                    images_clean = images_clean.repeat_interleave(num_restarts, dim=0)
                 batch_dict = {
                     'batch': batch,
                     'images_adv': images_adv.to(self.device),

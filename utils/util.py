@@ -85,10 +85,10 @@ def random_init(x, norm_type, epsilon):
     """
     delta = torch.zeros_like(x)
     if norm_type == NormType.Linf:
-        delta.data.uniform_(0.0, 1.0)
+        delta.data.uniform_(-1.0, 1.0)
         delta.data = delta.data * epsilon
     elif norm_type == NormType.L2:
-        delta.data.uniform_(0.0, 1.0)
+        delta.data.uniform_(-1.0, 1.0)
         delta.data = delta.data - x
         delta.data = clamp_by_l2(delta.data, epsilon)
     return delta

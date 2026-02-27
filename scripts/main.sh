@@ -14,15 +14,25 @@ MODEL_FILE=resnet_model.pth.tar
 Best_Model=resnet_model-best.pth.tar
 D=$ROOT
 SEED=1
-exp_name="6_PGD40_16_mix-loss06_adamw-plateau_1e3"
+exp_name="6_PGD40_16_mix-loss06_adamw-plateau_1e3_2"
 
 DIR=./output/${DATASET}/${TRAINER}/${CFG}/adv/${exp_name}
 TENSORBOARD_DIR= "./output/${DATASET}/${TRAINER}/${CFG}/adv/TensorBoard"
 PYTHON="./dassl/bin/python"
-echo "--------------------------------------------------------------------------------------"
 
 # 确保输出目录存在
 mkdir -p ${DIR}
+
+# 定义日志文件（在 tee 使用之前）
+LATEST_LOG=$(ls -t ${DIR}/log.txt-* 2>/dev/null | head -n 1)
+if [ -n "${LATEST_LOG}" ]; then
+    LOG_FILE="${LATEST_LOG}"
+else
+    LOG_FILE="${DIR}/log.txt"
+fi
+
+echo "--------------------------------------------------------------------------------------"
+echo "日志文件: ${LOG_FILE}"
 
 $PYTHON train.py \
 --root ${D} \
@@ -38,16 +48,8 @@ $PYTHON train.py \
 TRAINER.ADV.N_CTX ${NCTX} \
 TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
 TRAINER.ADV.CSC ${CSC} \
-TRAIN.TENSORBOARD_DIR "${TENSORBOARD_DIR}" 2>&1 | tee ${LOG_FILE}
+TRAIN.TENSORBOARD_DIR "${TENSORBOARD_DIR}" 2>&1 | tee -a ${LOG_FILE}
 
-# 查找最新的带时间戳的日志文件，如果没有则使用 log.txt
-LATEST_LOG=$(ls -t ${DIR}/log.txt-* 2>/dev/null | head -n 1)
-if [ -n "${LATEST_LOG}" ]; then
-    LOG_FILE="${LATEST_LOG}"
-else
-    LOG_FILE="${DIR}/log.txt"
-fi
-echo "日志文件: ${LOG_FILE}"
 # 发送邮件通知
 echo "发送训练完成邮件..."
 $PYTHON utils/email_sender.py \

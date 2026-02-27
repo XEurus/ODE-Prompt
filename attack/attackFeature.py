@@ -17,10 +17,12 @@ class PGD():
         self.num_restarts = kwargs.get('num_restarts', 1)
 
 
-    def run(self, net, image, target=None, scaler=1, feature_layer='fc', *args):
+    def run(self, net, image, target=None, scaler=1, feature_layer='fc', return_all=False, *args):
         hook = SingleModelHook(net, feature_layer, use_inp=True)
 
         criterion = torch.nn.KLDivLoss(reduction='batchmean')
+        # 用于逐样本评估的损失函数
+        criterion_none = torch.nn.KLDivLoss(reduction='none')
 
         with torch.no_grad():
             if target is None:
@@ -36,10 +38,12 @@ class PGD():
             else:
                 raise ('Error when init clean embedding')
 
-        best_adv = None
-        best_loss = float('-inf')
         all_adv_samples = []  # 收集所有重启的对抗样本
-
+        best_adv = image.clone()
+        # 初始化逐样本的最优损失为极小值
+        best_loss = torch.full((image.size(0),), float('-inf'), device=image.device)
+        print("start collect", flush=True)
+        best_index = 0
         for restart in range(self.num_restarts):
             iteration = self.attack(image)
 
@@ -54,18 +58,30 @@ class PGD():
                 hook.clear()
 
             image_adv = next(iteration)
+            all_adv_samples.append(image_adv.clone())
 
             with torch.no_grad():
                 net(self.preprocess(image_adv))
-                final_loss = criterion(hook.get_hooked_value().log_softmax(dim=-1), clean_embeddings.softmax(dim=-1))
+                # 逐样本计算 KL 散度
+                sample_loss = criterion_none(hook.get_hooked_value().log_softmax(dim=-1), clean_embeddings.softmax(dim=-1))
+                # 对除 batch 维度外的其他维度求和，得到每个样本的标量损失
+                sample_loss = sample_loss.sum(dim=-1)
                 hook.clear()
 
-            if final_loss.item() > best_loss:
-                best_loss = final_loss.item()
-                best_adv = image_adv.clone()
-                best_index=restart
+            # 更新每个样本的最优对抗样本
+            improved = sample_loss > best_loss
+            if improved.any():
+                best_loss[improved] = sample_loss[improved]
+                best_adv[improved] = image_adv[improved]
+                if restart > 0:  # 简单记录是否有更好的被发现
+                    best_index = restart
+
+        print("best_index",best_index,"mean_best_loss",best_loss.mean().item(), flush=True)
         hook.remove()
-        print("best_index",best_index,"best_loss",best_loss)
+        
+        if return_all:
+            return torch.stack(all_adv_samples, dim=1)
+            
         return best_adv
                 # # 从所有重启中随机选择一个
         # if len(all_adv_samples) > 0:

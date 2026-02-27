@@ -75,7 +75,17 @@ class TextEncoder(nn.Module):
     def forward(self, prompts, tokenized_prompts):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        
+        # 启用 gradient checkpointing 以节省显存
+        if self.training:
+            # 必须用 torch.utils.checkpoint.checkpoint 包装变压器
+            # 为了使用 checkpointing，我们需要确保 x requires_grad
+            if not x.requires_grad:
+                x.requires_grad_(True)
+            x = torch.utils.checkpoint.checkpoint(self.transformer, x, use_reentrant=False)
+        else:
+            x = self.transformer(x)
+            
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
@@ -679,19 +689,24 @@ class AdvPT(TrainerX):
 
     def set_model_mode(self, mode="train", names=None):
         """
-        重写 set_model_mode 以确保冻结的编码器始终处于 eval 模式
-        
-        无论是训练还是测试模式，image_encoder 和 text_encoder 都必须保持 eval 模式
-        这对于含有 BatchNorm 的模型（如 ResNet backbone）尤为重要
+        重写 set_model_mode 以确保冻结的编码器始终处于 eval 模式，
+        并在训练时将不使用的 image_encoder 卸载到 CPU 以节省显存。
         """
         # 调用父类方法设置 prompt_learner 的模式
         super().set_model_mode(mode, names)
         
-        # 关键修复：确保冻结的编码器始终为 eval 模式
         # 获取实际的模型（处理 DataParallel 包装的情况）
         model = self.model.module if hasattr(self.model, 'module') else self.model
         model.image_encoder.eval()
         model.text_encoder.eval()
+
+        if mode == "train":
+            # 训练时我们只使用前向嵌入（forward_embedding），不需要 image_encoder
+            model.image_encoder.to("cpu")
+            torch.cuda.empty_cache()
+        else:
+            # 测试/验证时需要使用 image_encoder
+            model.image_encoder.to(self.device)
 
     def forward_backward_adv(self, batch_dict):
         batch, embedding_adv = batch_dict['batch'], batch_dict['images_adv']
@@ -949,7 +964,13 @@ class AdvPT(TrainerX):
             # 获取对应的对抗嵌入
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + label.shape[0]
-            embedding_adv = embedding_pkl[start_idx:end_idx].to(self.device)
+            embedding_adv = embedding_pkl[start_idx:end_idx]
+            
+            # 如果是 3D 张量 [bs, num_restarts, dim]，在评估时只取第 1 个 restart (通常是最强的或原图)
+            if embedding_adv.dim() == 3:
+                embedding_adv = embedding_adv[:, 0, :]
+                
+            embedding_adv = embedding_adv.to(self.device)
             
             # 使用对抗嵌入进行推理
             output = model.forward_embedding(embedding_adv)
@@ -980,7 +1001,13 @@ class AdvPT(TrainerX):
             label = batch["label"].to(self.device)
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + label.shape[0]
-            embedding_adv = embedding_pkl[start_idx:end_idx].to(self.device)
+            embedding_adv = embedding_pkl[start_idx:end_idx]
+
+            # 如果是 3D 张量 [bs, num_restarts, dim]，在评估时只取第 1 个 restart
+            if embedding_adv.dim() == 3:
+                embedding_adv = embedding_adv[:, 0, :]
+                
+            embedding_adv = embedding_adv.to(self.device)
 
             output = model.forward_embedding(embedding_adv)
             loss = F.cross_entropy(output, label, reduction="sum")
