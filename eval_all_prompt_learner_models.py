@@ -4,6 +4,7 @@ import csv
 import re
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 
 from dass.engine import build_trainer
@@ -45,6 +46,15 @@ def parse_args():
         help="pkl 数据目录（与 train.py --path 保持一致）",
     )
     parser.add_argument("--white-attack", type=str, default="PGD", help="白盒攻击类型，默认 PGD")
+    parser.add_argument("--black-attack", type=str, default="", help="黑盒攻击类型（如 RAP），留空则跳过黑盒评估")
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="full",
+        choices=["full", "test-only"],
+        help="评估模式: full=完整评估(clean/test/train/val), test-only=仅测试集+绘图",
+    )
 
     parser.add_argument(
         "--csv-path",
@@ -53,7 +63,15 @@ def parse_args():
         help="结果 CSV 输出路径；默认写入 prompt_learner/eval_all_models_clean_test_train_val.csv",
     )
 
+    parser.add_argument(
+        "--plot-path",
+        type=str,
+        default="",
+        help="曲线图输出路径 (test-only 模式); 默认写入 prompt_learner/eval_test_only_curve.png",
+    )
+
     parser.add_argument("opts", default=None, nargs=argparse.REMAINDER)
+    parser.add_argument("--note", type=str, default="None", help="training note/remark for experiment tracking")
     return parser.parse_args()
 
 
@@ -103,12 +121,115 @@ def get_required_pkl_paths(cfg, pkl_root: Path, attack: str):
     }
 
 
+def get_black_pkl_path(cfg, pkl_root: Path, black_attack: str):
+    dataset_name = cfg.DATASET.NAME
+    return pkl_root / f"{dataset_name}_{black_attack}.pkl"
+
+
 def assert_required_pkl_paths(required_paths):
     missing = [str(path) for path in required_paths.values() if not path.exists()]
     if missing:
         raise FileNotFoundError(
             "以下必需 pkl 文件不存在，请先准备完整数据：\n- " + "\n- ".join(missing)
         )
+
+
+def eval_test_only_mode(args, prompt_learner_dir, model_files, model_dir, trainer, has_black):
+    """test-only 模式: 仅评估测试集并绘制曲线"""
+    import re
+
+    csv_path = args.csv_path
+    if not csv_path:
+        csv_path = str(prompt_learner_dir / "eval_test_only.csv")
+
+    plot_path = args.plot_path
+    if not plot_path:
+        plot_path = str(prompt_learner_dir / "eval_test_only_curve.png")
+
+    rows = []
+    step_numbers = []
+    robust_accs = []
+    black_accs = []
+
+    for model_path in model_files:
+        model_file = model_path.name
+        print("\n" + "=" * 80)
+        print(f"Evaluating: {model_file}")
+        print("=" * 80)
+
+        row = {
+            "model_file": model_file,
+            "robust_accuracy": "",
+            "black_accuracy": "",
+            "status": "ok",
+            "error": "",
+        }
+
+        try:
+            trainer.load_model(model_dir, model_file=model_file)
+
+            print("[1/2] Evaluating: test set (white-box adversarial images)")
+            test_acc = float(trainer.test_adv(split="test"))
+            row["robust_accuracy"] = f"{test_acc:.4f}"
+
+            if has_black:
+                print(f"[2/2] Evaluating: test set (black-box {args.black_attack} images)")
+                trainer.before_black_test(args.path, args.black_attack)
+                black_acc = float(trainer.test_adv(split="test"))
+                row["black_accuracy"] = f"{black_acc:.4f}"
+                black_accs.append(black_acc)
+            else:
+                print("[2/2] Skipping: black-box attack (--black-attack not specified)")
+
+            m = re.search(r"\.pth\.tar-(\d+)$", model_file)
+            step_num = int(m.group(1)) if m else len(step_numbers)
+            step_numbers.append(step_num)
+            robust_accs.append(test_acc)
+
+            print(f"\n[Done] {model_file} | robust={row['robust_accuracy']}% | black={row['black_accuracy'] or 'N/A'}%")
+        except Exception as exc:
+            row["status"] = "error"
+            row["error"] = str(exc)
+            print(f"[Error] {model_file}: {exc}")
+
+        rows.append(row)
+
+    # 保存 CSV
+    csv_parent = Path(csv_path).resolve().parent
+    csv_parent.mkdir(parents=True, exist_ok=True)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["model_file", "robust_accuracy", "black_accuracy", "status", "error"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # 绘制曲线
+    if step_numbers:
+        plt.figure(figsize=(10, 6))
+        plt.plot(step_numbers, robust_accs, "r-s", label=f"White-box Robust Acc ({args.white_attack})", linewidth=2, markersize=6)
+        if has_black and black_accs:
+            plt.plot(step_numbers[:len(black_accs)], black_accs, "b-^", label=f"Black-box Robust Acc ({args.black_attack})", linewidth=2, markersize=6)
+        plt.xlabel("Training Step", fontsize=12)
+        plt.ylabel("Accuracy (%)", fontsize=12)
+        plt.title("Test Set: Robust Accuracy", fontsize=14)
+        plt.legend(fontsize=11)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"\nCurve saved to: {plot_path}")
+
+    print("\n" + "=" * 80)
+    print("test-only 评估完成:")
+    for row in rows:
+        print(
+            f"- {row['model_file']}: robust={row['robust_accuracy'] or 'N/A'}, "
+            f"black={row['black_accuracy'] or 'N/A'}, status={row['status']}"
+        )
+    print(f"CSV 已保存到: {csv_path}")
 
 
 def main():
@@ -139,6 +260,17 @@ def main():
     required_pkl_paths = get_required_pkl_paths(cfg, pkl_root, args.white_attack)
     assert_required_pkl_paths(required_pkl_paths)
 
+    # 检查黑盒 pkl 是否存在
+    has_black = False
+    if args.black_attack:
+        black_pkl_path = get_black_pkl_path(cfg, pkl_root, args.black_attack)
+        if black_pkl_path.exists():
+            has_black = True
+            print(f"- black ({args.black_attack}): {black_pkl_path}")
+        else:
+            print(f"[Warning] 黑盒 pkl 不存在: {black_pkl_path}，跳过黑盒评估")
+            print(f"  请先运行: python black.py --dataset {cfg.DATASET.NAME} --path {args.path}")
+
     print("Using pkl files:")
     for key in ["clean", "test", "train", "val"]:
         print(f"- {key}: {required_pkl_paths[key]}")
@@ -152,6 +284,10 @@ def main():
     model_files = list_model_files(prompt_learner_dir)
     model_dir = str(exp_dir)
 
+    if args.mode == "test-only":
+        return eval_test_only_mode(args, prompt_learner_dir, model_files, model_dir, trainer, has_black)
+
+    # Full mode (original logic)
     csv_path = args.csv_path
     if not csv_path:
         csv_path = str(prompt_learner_dir / "eval_all_models_clean_test_train_val.csv")
@@ -167,6 +303,7 @@ def main():
             "model_file": model_file,
             "clean_accuracy": "",
             "test_accuracy": "",
+            "black_accuracy": "",
             "train_accuracy": "",
             "val_accuracy": "",
             "clean_train_embedding_accuracy": "",
@@ -177,14 +314,25 @@ def main():
         try:
             trainer.load_model(model_dir, model_file=model_file)
 
-            print("[1/5] Evaluating: test set (clean images - standard clean accuracy)")
+            n_steps = 5 + (1 if has_black else 0)
+            print(f"[1/{n_steps}] Evaluating: test set (clean images - standard clean accuracy)")
             clean_acc = float(trainer.test())
-            
-            print("[2/5] Evaluating: test set (adversarial PGD images - robust accuracy)")
+
+            print(f"[2/{n_steps}] Evaluating: test set (white-box {args.white_attack} - robust accuracy)")
             test_acc = float(trainer.test_adv(split="test"))
 
+            if has_black:
+                print(f"[3/{n_steps}] Evaluating: test set (black-box {args.black_attack} - black-box robust accuracy)")
+                trainer.before_black_test(args.path, args.black_attack)
+                black_acc = float(trainer.test_adv(split="test"))
+                row["black_accuracy"] = f"{black_acc:.4f}"
+                # 恢复白盒 test_pkl 供后续 before_* 调用
+                trainer.before_adv_test(path=str(pkl_root), attack=args.white_attack)
+            else:
+                print(f"[3/{n_steps}] Skipping: black-box attack (--black-attack not specified or pkl not found)")
+
             # train/val 使用预计算 embedding 完整评估（all batches）
-            print("[3/5] Evaluating: train set (adversarial embeddings from _v2.pkl)")
+            print(f"[{3 + (1 if has_black else 1)}/{n_steps}] Evaluating: train set (adversarial embeddings from _v2.pkl)")
             train_acc = eval_adv_embedding_full(
                 trainer,
                 trainer.train_pkl,
@@ -194,13 +342,13 @@ def main():
 
             val_acc = ""
             if trainer.val_loader is not None and getattr(trainer, "val_pkl", None) is not None:
-                print("[4/5] Evaluating: val set (adversarial embeddings from _val_v2.pkl)")
+                print(f"[{4 + (1 if has_black else 1)}/{n_steps}] Evaluating: val set (adversarial embeddings from _val_v2.pkl)")
                 val_acc = f"{eval_adv_embedding_full(trainer, trainer.val_pkl, trainer.val_loader, split_name='val'):.4f}"
             else:
-                print("[4/5] Skipping: val set (no val_loader or val_pkl available)")
+                print(f"[{4 + (1 if has_black else 1)}/{n_steps}] Skipping: val set (no val_loader or val_pkl available)")
 
             # clean.pkl（训练集 clean embedding）完整评估
-            print("[5/5] Evaluating: train set (clean embeddings from _clean.pkl)")
+            print(f"[{n_steps}/{n_steps}] Evaluating: train set (clean embeddings from _clean.pkl)")
             clean_train_embed_acc = eval_adv_embedding_full(
                 trainer,
                 trainer.clean_pkl,
@@ -216,11 +364,12 @@ def main():
 
             print(
                 f"\n[Done] {model_file} | Results Summary:\n"
-                f"  - test (clean):       {row['clean_accuracy']}%\n"
-                f"  - test (PGD adv):     {row['test_accuracy']}%\n"
-                f"  - train (adv embed):  {row['train_accuracy']}%\n"
-                f"  - val (adv embed):    {row['val_accuracy'] or 'N/A'}%\n"
-                f"  - train (clean embed): {row['clean_train_embedding_accuracy']}%"
+                f"  - test (clean):         {row['clean_accuracy']}%\n"
+                f"  - test (white-box adv): {row['test_accuracy']}%\n"
+                f"  - test (black-box adv): {row['black_accuracy'] or 'N/A'}%\n"
+                f"  - train (adv embed):    {row['train_accuracy']}%\n"
+                f"  - val   (adv embed):    {row['val_accuracy'] or 'N/A'}%\n"
+                f"  - train (clean embed):  {row['clean_train_embedding_accuracy']}%"
             )
         except Exception as exc:
             row["status"] = "error"
@@ -239,6 +388,7 @@ def main():
                 "model_file",
                 "clean_accuracy",
                 "test_accuracy",
+                "black_accuracy",
                 "train_accuracy",
                 "val_accuracy",
                 "clean_train_embedding_accuracy",
@@ -254,9 +404,9 @@ def main():
     for row in rows:
         print(
             f"- {row['model_file']}: clean={row['clean_accuracy'] or 'N/A'}, "
-            f"test={row['test_accuracy'] or 'N/A'}, train={row['train_accuracy'] or 'N/A'}, "
-            f"val={row['val_accuracy'] or 'N/A'}, clean_train_emb={row['clean_train_embedding_accuracy'] or 'N/A'}, "
-            f"status={row['status']}"
+            f"test={row['test_accuracy'] or 'N/A'}, black={row['black_accuracy'] or 'N/A'}, "
+            f"train={row['train_accuracy'] or 'N/A'}, val={row['val_accuracy'] or 'N/A'}, "
+            f"clean_train_emb={row['clean_train_embedding_accuracy'] or 'N/A'}, status={row['status']}"
         )
     print(f"CSV 已保存到: {csv_path}")
 

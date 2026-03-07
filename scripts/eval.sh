@@ -1,13 +1,61 @@
 
+# ==================== 配置 ====================
+GPU=0
+export CUDA_VISIBLE_DEVICES=$GPU
 
 PYTHON="./dassl/bin/python"
+
+DATASET=oxford_pets
+BACKBONE=vit_b16
+TRAINER=AdvPT
+EXP_NAME=7_PGD40_16_mix-loss06_adamw-plateau_1e3_10
+
+PROMPT_LEARNER_DIR=./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${EXP_NAME}/prompt_learner
+PKL_PATH=./pkl_data_mix_5
+CONFIG_FILE=configs/trainers/${TRAINER}/${BACKBONE}/${DATASET}.yaml
+DATASET_CONFIG=configs/datasets/${DATASET}.yaml
+
+# ==================== 白盒评估 (test-only 模式) ====================
 echo "--------------------------------------------------------------------------------------"
+echo "[白盒] test-only 评估: ${EXP_NAME}"
 $PYTHON eval_all_prompt_learner_models.py \
-  --prompt-learner-dir /root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/output/ucf101/AdvPT/vit_b16/adv/5_PGD40_16_mix6_sgd_1e3_60/prompt_learner \
-  --path /root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/pkl_data \
-  --dataset-config-file configs/datasets/ucf101.yaml \
-  --config-file configs/trainers/AdvPT/vit_b16.yaml \
-  --white-attack PGD
+  --prompt-learner-dir ${PROMPT_LEARNER_DIR} \
+  --path ${PKL_PATH} \
+  --dataset-config-file ${DATASET_CONFIG} \
+  --config-file ${CONFIG_FILE} \
+  --white-attack PGD \
+  --mode test-only \
+  --plot-path ./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${EXP_NAME}/curve_white.png \
+  --csv-path ./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${EXP_NAME}/eval_white_only.csv
+
+# ==================== 黑盒+白盒联合评估 (test-only 模式) ====================
+# 需先运行 black.py 生成对抗样本:
+#   python black.py --gpu 0 --dataset OxfordPets --path ${PKL_PATH}
+# echo "--------------------------------------------------------------------------------------"
+# echo "[黑盒+白盒] test-only 评估: ${EXP_NAME}"
+# $PYTHON eval_all_prompt_learner_models.py \
+#   --prompt-learner-dir ${PROMPT_LEARNER_DIR} \
+#   --path ${PKL_PATH} \
+#   --dataset-config-file ${DATASET_CONFIG} \
+#   --config-file ${CONFIG_FILE} \
+#   --white-attack PGD \
+#   --black-attack RAP \
+#   --mode test-only \
+#   --plot-path ./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${EXP_NAME}/curve_black_white.png \
+#   --csv-path ./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${EXP_NAME}/eval_black_white_only.csv
+
+# ==================== 完整评估 (full 模式，含 train/val embedding) ====================
+# echo "--------------------------------------------------------------------------------------"
+# echo "[Full] 完整评估: ${EXP_NAME}"
+# $PYTHON eval_all_prompt_learner_models.py \
+#   --prompt-learner-dir ${PROMPT_LEARNER_DIR} \
+#   --path ${PKL_PATH} \
+#   --dataset-config-file ${DATASET_CONFIG} \
+#   --config-file ${CONFIG_FILE} \
+#   --white-attack PGD \
+#   --black-attack RAP \
+#   --mode full \
+#   --csv-path ./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${EXP_NAME}/eval_full.csv
 
 # sleep 60
 # shutdown -h now

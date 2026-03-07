@@ -80,7 +80,10 @@ class PGD():
         hook.remove()
         
         if return_all:
-            return torch.stack(all_adv_samples, dim=1)
+            # stack gives [N, num_restarts, C, H, W]
+            # view flattens to [N * num_restarts, C, H, W]
+            res = torch.stack(all_adv_samples, dim=1)
+            return res.view(-1, *res.shape[2:])
             
         return best_adv
                 # # 从所有重启中随机选择一个

@@ -146,6 +146,9 @@ def reset_cfg(cfg, args):
         else:
             cfg.MODEL.FILE_PREFIX = args.model_file
 
+    if args.note:
+        cfg.NOTE = args.note
+
 
 def extend_cfg(cfg):
     """
@@ -189,6 +192,7 @@ def extend_cfg(cfg):
     cfg.DATASET.Test_PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
 
     cfg.MODEL.FILE_PREFIX = "model"               # 模型文件名前缀
+    cfg.NOTE = ""                                  # 训练备注
 
 
 
@@ -250,6 +254,9 @@ def main(args):
     if not os.path.exists(args.path):
         os.makedirs(args.path)
     
+    if cfg.NOTE:
+        print(f"[TRAINING NOTE] {cfg.NOTE}")
+
     # 调试信息
     print_args(args, cfg, cfg.OUTPUT_DIR)
     # print("Collecting env info ...")
@@ -375,7 +382,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
     parser.add_argument("--output-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv", help="output directory")
-    parser.add_argument("--path", type=str, default="./pkl_data_mix_3/", help="directory of pkl")
+    parser.add_argument("--path", type=str, default="./pkl_data_mix_5/", help="directory of pkl")
     
     # 训练控制
     parser.add_argument("--adv-training", action="store_true", default=True, help="启用对抗训练（使用对抗样本增强训练）")
@@ -404,6 +411,7 @@ if __name__ == "__main__":
     # 额外配置
     parser.add_argument("opts", default=None, nargs=argparse.REMAINDER,help="modify config options using the command-line")
     parser.add_argument("--seed", type=int, default=1, help="only positive value enables a fixed seed")
+    parser.add_argument("--note", type=str, default="", help="training note/remark for experiment tracking")
     
     args = parser.parse_args()
 

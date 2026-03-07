@@ -532,8 +532,41 @@ class SimpleTrainer(TrainerBase):
             self.write_scalar("hparams/partial_test_batches", float(getattr(self.cfg.TEST, "PARTIAL_TEST_BATCHES", 10)), 0)
             self.write_scalar("hparams/checkpoint_freq", float(getattr(self.cfg.TRAIN, "CHECKPOINT_FREQ", 0)), 0)
 
+            # 记录训练备注
+            if hasattr(self.cfg, 'NOTE') and self.cfg.NOTE:
+                self._writer.add_text("hparams/note", str(self.cfg.NOTE), 0)
+                print(f"[TensorBoard] Recorded training note: {self.cfg.NOTE}")
+
         # 记录开始时间
         self.time_start = time.time()
+
+    def _expand_dataset_and_pkl(self):
+        """
+        如果在 before_adv_train 中生成或加载的 train_pkl 包含多个 restart，
+        将其展平为 [5N, dim]，并同步扩展所有相关的 DataLoader 的 data_source。
+        这样在训练时可以直接把 [5N, C, H, W] 作为常规的数据流进行处理，而不需要在 batch 内展开。
+        """
+        if hasattr(self, 'train_pkl') and self.train_pkl.dim() == 3:
+            N, num_restarts, dim = self.train_pkl.shape
+            self.train_pkl = self.train_pkl.view(-1, dim)
+            print(f"[before_adv_train] Flattened train_pkl to {self.train_pkl.shape}")
+            
+            # 扩展相关 dataloader 的 dataset
+            loaders = [
+                getattr(self, 'train_loader_x', None),
+                getattr(self, 'train_loader_x_noshuffle', None),
+                getattr(self, 'train_loader_x_notransform_noshuffle', None)
+            ]
+            for loader in loaders:
+                if loader is not None:
+                    new_data_source = []
+                    for item in loader.dataset.data_source:
+                        for _ in range(num_restarts):
+                            new_data_source.append(item)
+                    loader.dataset.data_source = new_data_source
+            
+            if loaders[1] is not None:
+                print(f"[before_adv_train] Expanded dataset lengths to {len(loaders[1].dataset.data_source)}")
 
     def before_adv_train(self, path, attack='PGD'):
         """
@@ -552,6 +585,7 @@ class SimpleTrainer(TrainerBase):
         if os.path.isfile(pkl_path):
             self.train_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
             print(f'[before_adv_train] Loaded train_pkl from {pkl_path}')
+            self._expand_dataset_and_pkl()
             return
         
         print("[before_adv_train] Generating adversarial embeddings...")
@@ -575,7 +609,7 @@ class SimpleTrainer(TrainerBase):
         if attack == 'PGD':
             # 攻击器使用相同的 normalizer，内部会归一化后传给网络
             num_iters = getattr(self.cfg.DATASET, 'Train_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
-            num_restarts = getattr(self.cfg.DATASET, 'Train_PGD_NUM_RESTARTS', 5)
+            num_restarts = getattr(self.cfg.DATASET, 'Train_PGD_NUM_RESTARTS', 10)
             attacker = create_pgd_attacker(train_eps, normalizer, self.cfg, num_iters=num_iters, num_restarts=num_restarts)
             print(f"[before_adv_train] Using PGD attack with eps={train_eps}/255, iters={num_iters}, restarts={num_restarts}")
         else:
@@ -598,27 +632,29 @@ class SimpleTrainer(TrainerBase):
             inputs_pixel = batch['img'].to(self.device)
             
             # PGD 攻击（攻击器内部会归一化后传给网络）
-            # 设置 return_all=True，返回的是 [bs, num_restarts, C, H, W] 像素空间的对抗样本
+            # 设置 return_all=True，返回的是 [bs * num_restarts, C, H, W] 像素空间的对抗样本
             images_adv_pixel_all = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc', return_all=True)
             
             # 验证扰动范围 (针对所有样本)
             eps_val = train_eps / 255.
-            diff = images_adv_pixel_all - inputs_pixel.unsqueeze(1)
+            # 需要先将 inputs_pixel 复制 num_restarts 份以匹配维度用于差值计算
+            # [bs, C, H, W] -> [bs, num_restarts, C, H, W] -> [bs * num_restarts, C, H, W]
+            inputs_pixel_repeated = inputs_pixel.unsqueeze(1).repeat(1, num_restarts, 1, 1, 1).view(-1, *inputs_pixel.shape[1:])
+            
+            diff = images_adv_pixel_all - inputs_pixel_repeated
             assert torch.max(diff) < (eps_val + 1e-6)
             assert torch.min(diff) > (-eps_val - 1e-6)
             
-            # 展平 batch 和 restart 维度以进行归一化和特征提取
-            bs, n_restarts, c, h, w = images_adv_pixel_all.shape
-            images_adv_pixel_flat = images_adv_pixel_all.view(-1, c, h, w)
-            
-            # 归一化后提取特征
-            images_adv_normalized_flat = normalizer.normalize(images_adv_pixel_flat)
+            # 由于已经是展平的，直接归一化并提取特征
+            images_adv_normalized_flat = normalizer.normalize(images_adv_pixel_all)
             
             with torch.no_grad():
                 embedding_flat = image_encoder(images_adv_normalized_flat.type(dtype))
                 
-            # 恢复形状 [bs, num_restarts, dim]
-            embedding = embedding_flat.view(bs, n_restarts, -1)
+            # 恢复形状 [bs, num_restarts, dim] 以按原来的方式保存到 [N, num_restarts, dim]
+            # 之后再统一展平
+            bs = inputs_pixel.shape[0]
+            embedding = embedding_flat.view(bs, num_restarts, -1)
 
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + embedding.shape[0]
@@ -631,6 +667,8 @@ class SimpleTrainer(TrainerBase):
         print(f'[before_adv_train] Generated and saved train_pkl to {pkl_path}')
         del surrogate
         torch.cuda.empty_cache()
+        
+        self._expand_dataset_and_pkl()
 
     def before_clean_train(self, path):
         """
@@ -648,6 +686,12 @@ class SimpleTrainer(TrainerBase):
         if os.path.isfile(pkl_path):
             self.clean_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
             print(f'[before_clean_train] Loaded clean_pkl from {pkl_path}')
+            
+            data_loader = getattr(self, 'train_loader_x_notransform_noshuffle', None)
+            if data_loader is not None and self.clean_pkl.shape[0] != len(data_loader.dataset):
+                ratio = len(data_loader.dataset) // self.clean_pkl.shape[0]
+                self.clean_pkl = self.clean_pkl.repeat_interleave(ratio, dim=0)
+                print(f"[before_clean_train] Expanded clean_pkl {ratio}x to {self.clean_pkl.shape}")
             return
         
         print("[before_clean_train] Generating clean embeddings...")
@@ -1291,23 +1335,14 @@ class TrainerX(SimpleTrainer):
             start_idx = self.batch_idx * self.train_loader_x_noshuffle.batch_size
             end_idx = (self.batch_idx + 1) * self.train_loader_x_noshuffle.batch_size
             
-            images_adv = self.train_pkl[start_idx:end_idx] # [bs, num_restarts, dim] or [bs, dim]
+            images_adv = self.train_pkl[start_idx:end_idx] # 已经是 [bs, dim]
             
-            # 如果 images_adv 是 3D 张量 [bs, num_restarts, dim]，我们需要展开它以利用所有重启样本
-            if images_adv.dim() == 3:
-                bs, num_restarts, dim = images_adv.shape
-                images_adv = images_adv.view(-1, dim) # [bs * num_restarts, dim]
-                # 对应地展开 batch 中的标签，以便损失函数能正确计算
-                # 假设 batch 是一个字典，包含 'label' 和其他键
-                for key in batch:
-                    if isinstance(batch[key], torch.Tensor):
-                        batch[key] = batch[key].repeat_interleave(num_restarts, dim=0)
+            # 由于数据集已经展开，所以 batch 中的 label 也是展开后的
+            # 不需要像之前那样在内部通过 repeat_interleave 展开
 
             # 数据混合: 按mix_clean_ratio概率随机选择干净或对抗嵌入
             if use_data_mixing:
                 images_clean = self.clean_pkl[start_idx:end_idx]
-                if images_adv.shape[0] > images_clean.shape[0]: # 发生了展开
-                    images_clean = images_clean.repeat_interleave(num_restarts, dim=0)
                 batch_size = images_adv.shape[0]
                 
                 # 为每个样本随机决定使用干净还是对抗嵌入
@@ -1324,8 +1359,6 @@ class TrainerX(SimpleTrainer):
             else:
                 # 无数据混合，使用纯对抗嵌入
                 images_clean = self.clean_pkl[start_idx:end_idx] if use_clean_guidance else None
-                if images_clean is not None and images_adv.shape[0] > images_clean.shape[0]:
-                    images_clean = images_clean.repeat_interleave(num_restarts, dim=0)
                 batch_dict = {
                     'batch': batch,
                     'images_adv': images_adv.to(self.device),

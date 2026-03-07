@@ -1,4 +1,27 @@
-import tqdm
+import os
+import sys
+import math
+import argparse
+from datetime import datetime
+
+import numpy as np
+import scipy.stats as st
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.autograd as autograd
+import torch.distributions as tdist
+import torchvision
+from torchvision import models, transforms
+from torch import randperm
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+import clip
+
+# 注册数据集（触发自动注册到 DASS 框架）
 import datasets.oxford_pets
 import datasets.oxford_flowers
 import datasets.fgvc_aircraft
@@ -10,47 +33,18 @@ import datasets.sun397
 import datasets.caltech101
 import datasets.ucf101
 import datasets.imagenet
+
 from dass.data import DataManager
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, models, transforms
-import clip
 from dass.utils import setup_logger, set_random_seed, collect_env_info
 from dass.config import get_cfg_default
 
-import os
-import sys
-import math
-import clip
-import torch
-from datetime import datetime
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.autograd as autograd
-import torchvision
-import torchvision.datasets as td
-import torch.distributions as tdist
-import argparse
-from torchvision import models, transforms
-import torch.serialization
-from PIL import Image
-import csv
-import numpy as np
-import scipy.stats as st
-from torch import randperm
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import foolbox
-# from SIA import SIA
-
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 prec = 'fp32'
 mean_value, std_value = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
-mean = torch.tensor(mean_value).view(-1, 1, 1).to(device)
-std = torch.tensor(std_value).view(-1, 1, 1).to(device)
+# 注意: mean/std 在模块级别保持 CPU，在函数内部通过 .to(device) 迁移
+# 这样 CUDA_VISIBLE_DEVICES 可以在 __main__ 中正确设置后再初始化 CUDA
+mean = torch.tensor(mean_value).view(-1, 1, 1)
+std = torch.tensor(std_value).view(-1, 1, 1)
 
 
 def wrap_model(model):
@@ -90,7 +84,9 @@ def extend_cfg(cfg):
 
 
 
-def finetune(model, train_loader, num_epochs = 90):
+def finetune(model, train_loader, device, num_epochs=90):
+    _mean = mean.to(device)
+    _std = std.to(device)
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
     if isinstance(model, nn.Sequential):
@@ -100,9 +96,7 @@ def finetune(model, train_loader, num_epochs = 90):
         params = model.fc.parameters()
     optimizer = optim.AdamW(params, lr=0.001)
     scheduler = CosineAnnealingLR(optimizer, num_epochs)
-    # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60], gamma=0.1)
 
-    # print(model)
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -110,8 +104,7 @@ def finetune(model, train_loader, num_epochs = 90):
             optimizer.zero_grad()
             inputs = batch['img'].to(device)
             labels = batch['label'].to(device)
-            inputs *= std
-            inputs += mean
+            inputs = inputs * _std + _mean
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
@@ -123,10 +116,19 @@ def finetune(model, train_loader, num_epochs = 90):
     return model
 
 
-def rap_attack(model_source, test_loader, root):
-    # os.environ["CUDA_VISIBLE_DEVICES"] = '0'
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
-
+def rap_attack(model_source, test_loader, root, cfg, arg, device):
+    """RAP (Random Adversarial Perturbation) 黑盒攻击
+    
+    Args:
+        model_source: 代理模型
+        test_loader: 测试数据加载器
+        root: pkl保存路径
+        cfg: 配置对象
+        arg: 命令行参数
+        device: torch device
+    """
+    _mean = mean.to(device)
+    _std = std.to(device)
     arg.adv_alpha = arg.adv_epsilon / arg.adv_steps
 
     def makedir(path):
@@ -362,8 +364,7 @@ def rap_attack(model_source, test_loader, root):
         inputs = batch['img'].to(device)
         labels = batch['label'].to(device)
         target_labels = batch['label'].to(device)
-        inputs *= std
-        inputs += mean
+        inputs = inputs * _std + _mean
         X_ori = inputs
         batch_size_cur = len(X_ori)
 
@@ -620,6 +621,7 @@ def rap_attack(model_source, test_loader, root):
 if __name__ == "__main__":
     ## hyperparameter
     parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu', type=str, default='0', help='指定GPU编号，如 0 或 0,1')
     parser.add_argument('--source_model', type=str, default='resnet50',
                         choices=['resnet50', 'inception-v3', 'densenet121', 'vgg16bn'])
     parser.add_argument('--batch_size', type=int, default=256)
@@ -647,47 +649,35 @@ if __name__ == "__main__":
     parser.add_argument("--path", type=str, default="./pkl_data/", help="directory of pkl")
     arg = parser.parse_args()
 
+    # 设置 GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = arg.gpu
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
-    # cfg.OPTIM.NAME = "sgd"
-    # cfg.OPTIM.LR = 0.002
-    # cfg.OPTIM.MAX_EPOCH = 150
-    # cfg.OPTIM.LR_SCHEDULER = "cosine"
-    # cfg.OPTIM.WARMUP_EPOCH = 1
-    # cfg.OPTIM.WARMUP_TYPE = "constant"
-    # cfg.OPTIM.WARMUP_CONS_LR = 1e-5
     cfg = get_cfg_default()
     cfg.DATASET.NAME = arg.dataset
     cfg.DATASET.ROOT = arg.root
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"
-    # cfg.DATASET.num_classes = 37
-    # cfg.INPUT.SIZE  (224, 224)
 
     cfg.INPUT.INTERPOLATION = "bicubic"
     cfg.INPUT.PIXEL_MEAN = [0.48145466, 0.4578275, 0.40821073]
     cfg.INPUT.PIXEL_STD = [0.26862954, 0.26130258, 0.27577711]
+    # 训练集使用随机增强，测试集由 DataManager 自动使用确定性变换
     cfg.INPUT.TRANSFORMS = ["random_resized_crop", "random_flip", "normalize"]
 
     cfg.DATALOADER.TEST.BATCH_SIZE = 8
     dm = DataManager(cfg, arg.batch_size)
     num_classes = dm.num_classes
     train_loader_x = dm.train_loader_x
-    # train_loader_u = dm.train_loader_u  # optional, can be None
-    # val_loader = dm.val_loader  # optional, can be None
     test_loader = dm.test_loader
 
     model = torchvision.models.resnet50(pretrained=True)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
-    #model.load_state_dict(torch.load('OxfordPets_CLIP_RN50.pth'))
 
     train_loader = train_loader_x
-    val_loader = test_loader
     if not os.path.exists(arg.path):
         os.makedirs(arg.path)
     model = wrap_model(model)
     if arg.dataset != 'ImageNet':
-        model = finetune(model, train_loader)
+        model = finetune(model, train_loader, device)
     torch.cuda.empty_cache()
-    rap_attack(model, test_loader, root=arg.path)
-
-
+    rap_attack(model, test_loader, root=arg.path, cfg=cfg, arg=arg, device=device)

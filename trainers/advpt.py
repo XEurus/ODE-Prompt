@@ -966,10 +966,6 @@ class AdvPT(TrainerX):
             end_idx = start_idx + label.shape[0]
             embedding_adv = embedding_pkl[start_idx:end_idx]
             
-            # 如果是 3D 张量 [bs, num_restarts, dim]，在评估时只取第 1 个 restart (通常是最强的或原图)
-            if embedding_adv.dim() == 3:
-                embedding_adv = embedding_adv[:, 0, :]
-                
             embedding_adv = embedding_adv.to(self.device)
             
             # 使用对抗嵌入进行推理
@@ -1002,10 +998,6 @@ class AdvPT(TrainerX):
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + label.shape[0]
             embedding_adv = embedding_pkl[start_idx:end_idx]
-
-            # 如果是 3D 张量 [bs, num_restarts, dim]，在评估时只取第 1 个 restart
-            if embedding_adv.dim() == 3:
-                embedding_adv = embedding_adv[:, 0, :]
                 
             embedding_adv = embedding_adv.to(self.device)
 

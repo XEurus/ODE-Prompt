@@ -596,18 +596,29 @@ class resnet10(TrainerX):
     def forward_backward_adv(self, batch_dict):
         batch, embedding_adv = batch_dict['batch'], batch_dict['images_adv']
         label = batch["label"].to(self.device)
+        use_loss_mix = 1
 
-        output = self.model.forward_embedding(embedding_adv)
-        loss_adv = torch.nn.CrossEntropyLoss()(output, label)
-        loss = loss_adv
-        # self.model_backward_and_update(loss) 原有更新方式
+        # 计算对抗损失的嵌入
+        output_adv = self.model.forward_embedding(embedding_adv)
+        loss_adv = torch.nn.CrossEntropyLoss()(output_adv, label)
+
+        if use_loss_mix:
+            # 计算与干净图像的损失（如果clean_pkl可用）
+            #if 'images_clean' in batch_dict and batch_dict['images_clean'] is not None:
+            embedding_clean = batch_dict['images_clean'].to(self.device)
+            output_clean = self.model.forward_embedding(embedding_clean)
+            loss_clean = torch.nn.CrossEntropyLoss()(output_clean, label)
+            # 1:1 比例混合
+            loss = 0.4 * loss_adv + 0.6 * loss_clean
+        else:
+            loss = loss_adv
 
         # 非有限 loss 直接跳过更新，避免训练中断
         if not torch.isfinite(loss):
             print("[WARN] Non-finite loss detected; skip update for this batch")
             loss_summary = {
                 "loss": loss.item(),
-                "acc": compute_accuracy(output, label)[0].item(),
+                "acc": compute_accuracy(output_adv, label)[0].item(),
             }
             return loss_summary
 
@@ -625,7 +636,7 @@ class resnet10(TrainerX):
 
         loss_summary = {
             "loss": loss.item(),
-            "acc": compute_accuracy(output, label)[0].item(),
+            "acc": compute_accuracy(output_adv, label)[0].item(),
         }
 
         if (self.batch_idx + 1) == self.num_batches:
@@ -690,6 +701,7 @@ class resnet10(TrainerX):
         
         # 获取每个 epoch 测试的 batch 数量
         max_batches = getattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES', 2)
+        partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
         
         # 1. 训练集对抗准确率
         train_acc = None
@@ -715,25 +727,34 @@ class resnet10(TrainerX):
                 max_batches=max_batches
             )
             print(f"      Val Adv Acc: {val_acc:.2f}%")
-            if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-                val_loss = self._eval_adv_embedding_loss(
-                    self.val_pkl,
-                    self.val_loader,
-                    max_batches=max_batches
-                )
+            # if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
+            val_loss = self._eval_adv_embedding_loss(
+                self.val_pkl,
+                self.val_loader,
+                max_batches=max_batches
+            )
         elif hasattr(self, 'test_pkl') and self.test_pkl is not None:
             # 如果没有验证集对抗嵌入，使用测试集
             print(f'\n[2/2] Test Adversarial Accuracy (no val_pkl):')
             val_acc = self.test_adv_partial(split="test", max_batches=max_batches)
             print(f"      Test Adv Acc: {val_acc:.2f}%")
-            if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-                val_loss = self._eval_adv_embedding_loss(
-                    self.test_pkl,
-                    self.test_loader,
-                    max_batches=max_batches
-                )
+            #if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
+            val_loss = self._eval_adv_embedding_loss(
+                self.test_pkl,
+                self.test_loader,
+                max_batches=max_batches
+            )
         else:
             print(f'\n[2/2] Validation adversarial test skipped')
+
+        # 3. 每个 epoch 额外评估部分 test（用于观察 val/test 偏差）
+        test_partial_acc = None
+        if hasattr(self, 'test_pkl') and self.test_pkl is not None:
+            print(f'\n[Extra] Partial Test Adversarial Accuracy ({partial_test_batches} batches):')
+            test_partial_acc = self.test_adv_partial(split="test", max_batches=partial_test_batches)
+            print(f"      Test Partial Adv Acc: {test_partial_acc:.2f}%")
+        else:
+            print(f'\n[Extra] Partial test adversarial evaluation skipped (test_pkl not prepared)')
         
         # 打印摘要
         summary_parts = []
@@ -741,6 +762,8 @@ class resnet10(TrainerX):
             summary_parts.append(f"Train: {train_acc:.2f}%")
         if val_acc is not None:
             summary_parts.append(f"Val: {val_acc:.2f}%")
+        if test_partial_acc is not None:
+            summary_parts.append(f"Test@{partial_test_batches}b: {test_partial_acc:.2f}%")
         if summary_parts:
             print(f"\n[Summary] {' | '.join(summary_parts)}")
         
@@ -751,6 +774,20 @@ class resnet10(TrainerX):
             self.write_scalar("epoch/val_adv_acc", val_acc, self.epoch)
         if val_loss is not None:
             self.write_scalar("epoch/val_adv_loss", val_loss, self.epoch)
+        if test_partial_acc is not None:
+            self.write_scalar("epoch/test_partial_adv_acc", test_partial_acc, self.epoch)
+        if val_acc is not None and test_partial_acc is not None:
+            gap = val_acc - test_partial_acc
+            #self.write_scalar("epoch/val_test_gap", gap, self.epoch)
+            self.write_scalar("epoch/val_test_gap_abs", abs(gap), self.epoch)
+
+        # 统一打印一行结构化指标，便于日志解析/画图
+        print(
+            f"[EpochMetrics] epoch={self.epoch + 1} "
+            f"train_adv_acc={train_acc if train_acc is not None else 'NA'} "
+            f"val_adv_acc={val_acc if val_acc is not None else 'NA'} "
+            f"test_partial_adv_acc={test_partial_acc if test_partial_acc is not None else 'NA'}"
+        )
 
         # 使用验证集损失驱动学习率调整（ReduceLROnPlateau）
         if self.cfg.OPTIM.LR_SCHEDULER == "plateau" and val_loss is not None:
@@ -812,7 +849,9 @@ class resnet10(TrainerX):
             # 获取对应的对抗嵌入
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + label.shape[0]
-            embedding_adv = embedding_pkl[start_idx:end_idx].to(self.device)
+            embedding_adv = embedding_pkl[start_idx:end_idx]
+            
+            embedding_adv = embedding_adv.to(self.device)
             
             # 使用对抗嵌入进行推理
             output = model.forward_embedding(embedding_adv)
@@ -843,7 +882,9 @@ class resnet10(TrainerX):
             label = batch["label"].to(self.device)
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + label.shape[0]
-            embedding_adv = embedding_pkl[start_idx:end_idx].to(self.device)
+            embedding_adv = embedding_pkl[start_idx:end_idx]
+                
+            embedding_adv = embedding_adv.to(self.device)
 
             output = model.forward_embedding(embedding_adv)
             loss = F.cross_entropy(output, label, reduction="sum")
