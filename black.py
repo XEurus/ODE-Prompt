@@ -48,7 +48,8 @@ std = torch.tensor(std_value).view(-1, 1, 1)
 
 
 def wrap_model(model):
-    normalize = torchvision.transforms.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
+    # ResNet-50 uses torchvision ImageNet weights → must use ImageNet mean/std
+    normalize = torchvision.transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     return torch.nn.Sequential(normalize, model)
 
 def extend_cfg(cfg):

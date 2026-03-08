@@ -146,10 +146,67 @@ def eval_test_only_mode(args, prompt_learner_dir, model_files, model_dir, traine
     if not plot_path:
         plot_path = str(prompt_learner_dir / "eval_test_only_curve.png")
 
+    # 在循环外预加载两个 pkl，避免循环内反复切换 self.test_pkl 造成状态污染
+    white_pkl = trainer.test_pkl  # 已由 before_adv_test 加载并归一化
+    black_pkl = None
+    from utils.adv_utils import ImageNormalizer
+    pkl_root = Path(args.path).resolve()
+    if has_black:
+        # 复制 before_black_test 的预处理逻辑：加载原始像素空间 pkl 并归一化
+        black_pkl_path = pkl_root / f"{trainer.cfg.DATASET.NAME}_{args.black_attack}.pkl"
+        _norm = ImageNormalizer(device='cpu')
+        _raw = torch.load(str(black_pkl_path), weights_only=False)
+        black_pkl = _norm.normalize(_raw)
+        print(f"[Preloaded] black pkl: {black_pkl_path}, shape={black_pkl.shape}")
+
     rows = []
     step_numbers = []
     robust_accs = []
     black_accs = []
+
+    # -----------------------------------------------------------------------
+    # Baseline row (step 0): 使用 "a photo of [classname]" 提示词，不加载任何
+    # 训练权重，代表未训练时的初始性能
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("Evaluating: BASELINE (a photo of [classname], untrained ODE)")
+    print("=" * 80)
+    baseline_row = {
+        "model_file": "baseline_a_photo_of",
+        "robust_accuracy": "",
+        "black_accuracy": "",
+        "status": "ok",
+        "error": "",
+    }
+    try:
+        from dass.engine import build_trainer as _build_trainer
+        from copy import deepcopy
+        baseline_cfg = deepcopy(trainer.cfg)
+        baseline_cfg.defrost()
+        baseline_cfg.TRAINER.ADV.CTX_INIT = "a photo of"
+        baseline_cfg.TRAINER.ADV.N_CTX = 3
+        baseline_cfg.freeze()
+        baseline_trainer = _build_trainer(baseline_cfg)
+        baseline_trainer.test_pkl = white_pkl
+        baseline_trainer.normalizer = trainer.normalizer
+        print("[Baseline] Evaluating white-box PGD", flush=True)
+        b_white = float(baseline_trainer.test_adv(split="test"))
+        baseline_row["robust_accuracy"] = f"{b_white:.4f}"
+        if has_black:
+            baseline_trainer.test_pkl = black_pkl
+            print(f"[Baseline] Evaluating black-box {args.black_attack}", flush=True)
+            b_black = float(baseline_trainer.test_adv(split="test"))
+            baseline_row["black_accuracy"] = f"{b_black:.4f}"
+            black_accs.append(b_black)
+        del baseline_trainer
+        step_numbers.append(0)
+        robust_accs.append(b_white)
+        print(f"[Baseline Done] robust={baseline_row['robust_accuracy']}% | black={baseline_row['black_accuracy'] or 'N/A'}%")
+    except Exception as exc:
+        baseline_row["status"] = "error"
+        baseline_row["error"] = str(exc)
+        print(f"[Baseline Error] {exc}")
+    rows.append(baseline_row)
 
     for model_path in model_files:
         model_file = model_path.name
@@ -169,12 +226,13 @@ def eval_test_only_mode(args, prompt_learner_dir, model_files, model_dir, traine
             trainer.load_model(model_dir, model_file=model_file)
 
             print("[1/2] Evaluating: test set (white-box adversarial images)")
+            trainer.test_pkl = white_pkl
             test_acc = float(trainer.test_adv(split="test"))
             row["robust_accuracy"] = f"{test_acc:.4f}"
 
             if has_black:
                 print(f"[2/2] Evaluating: test set (black-box {args.black_attack} images)")
-                trainer.before_black_test(args.path, args.black_attack)
+                trainer.test_pkl = black_pkl
                 black_acc = float(trainer.test_adv(split="test"))
                 row["black_accuracy"] = f"{black_acc:.4f}"
                 black_accs.append(black_acc)
