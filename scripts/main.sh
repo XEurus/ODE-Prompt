@@ -20,8 +20,8 @@ MODEL_FILE=resnet_model.pth.tar
 Best_Model=resnet_model-best.pth.tar
 D=$ROOT
 SEED=1
-exp_name="7_PGD40_16_mix-loss06_adamw-plateau_1e3_10"
-TRAINING_NOTE="使用10倍数据展平训练"
+exp_name="8_adamw-plateau_1e3_10_Lp_MLP"
+TRAINING_NOTE="进行谱归一化，并换用MLP模型"
 
 DIR=./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${exp_name}
 TENSORBOARD_DIR="./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/TensorBoard"

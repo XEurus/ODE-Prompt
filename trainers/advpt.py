@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
+from torch.nn.utils import spectral_norm
 import copy
 import time
 
@@ -133,9 +134,9 @@ class ODEFunc(nn.Module):
         self.act = nn.GELU()
 
         self.mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),nn.GELU(),
-        )
+            spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),nn.GELU(),
+            spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),nn.GELU(),
+        ) # 使用谱归一化
         
         self.res_blocks = nn.ModuleList()
         for _ in range(2):  # 2 个残差块
@@ -200,9 +201,9 @@ class ODEFunc(nn.Module):
         # Residual MLP 前向传播
         x = self.input_proj(inp)
         x = self.act(x) 
-        #x = self.mlp(x)
-        for block in self.res_blocks:
-            x = x + block(x)
+        x = self.mlp(x)
+        # for block in self.res_blocks:
+        #     x = x + block(x)
         
         # 输出层
         dp_dt = self.output_proj(x)
