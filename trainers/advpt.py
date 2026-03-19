@@ -129,7 +129,7 @@ class ODEFunc(nn.Module):
         #self.hidden_dim = 768
         self.hidden_dim = prompt_dim * 2
         
-        self.input_proj = nn.Linear(prompt_dim + visual_dim, self.hidden_dim)
+        self.input_proj = spectral_norm(nn.Linear(prompt_dim + visual_dim, self.hidden_dim))
         # self.norm_in = nn.LayerNorm(self.hidden_dim)
         self.act = nn.GELU()
 
@@ -153,15 +153,15 @@ class ODEFunc(nn.Module):
             #nn.init.zeros_(block[3].bias)
             self.res_blocks.append(block)
         
-        # 输出投影
-        self.output_proj = nn.Linear(self.hidden_dim, prompt_dim)
+        # 输出投影（应用谱归一化约束 Lipschitz 常数）
+        self.output_proj = spectral_norm(nn.Linear(self.hidden_dim, prompt_dim))
         
         # 关键修复：使用极小的高斯初始化而不是全零
         # 全零会导致 res_blocks 在初期梯度为0（梯度阻断）
         # 极小值 (1e-5) 既能保证 ODE 初始接近恒等，又能打通梯度
-        nn.init.zeros_(self.output_proj.weight)
-        # nn.init.normal_(self.output_proj.weight, std=1e-5)
-        nn.init.zeros_(self.output_proj.bias)
+        # nn.init.zeros_(self.output_proj.weight)
+        # # nn.init.normal_(self.output_proj.weight, std=1e-5)
+        # nn.init.zeros_(self.output_proj.bias)
     
     def set_visual_feature(self, z_v):
         """

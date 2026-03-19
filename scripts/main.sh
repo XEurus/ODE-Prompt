@@ -20,11 +20,11 @@ MODEL_FILE=resnet_model.pth.tar
 Best_Model=resnet_model-best.pth.tar
 D=$ROOT
 SEED=1
-exp_name="8_adamw-plateau_1e3_10_Lp_MLP"
-TRAINING_NOTE="进行谱归一化，并换用MLP模型"
+exp_name="8_adamw-plateau_1e3_Lp_MLP_10_SpectralAll"
+TRAINING_NOTE="输入输出层也进行谱归一化"
 
 DIR=./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${exp_name}
-TENSORBOARD_DIR="./output/${DATASET}/${TRAINER}/${BACKBONE}/adv/TensorBoard"
+TENSORBOARD_DIR="./output/${DATASET}/${TRAINER}/${BACKBONE}/tensorboard"
 PYTHON="./dassl/bin/python"
 
 # 确保输出目录存在
