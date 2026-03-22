@@ -173,42 +173,42 @@ class ODEFunc(nn.Module):
         # 移除 batch 均值，保留每个样本的独立特征
         self.z_v = z_v  # (batch_size, visual_dim)
 
-    def forward(self, t, p):
-        """
-        计算 ODE 导数 dp/dt = f_θ(p, z_v)
+    # def forward(self, t, p):
+    #     """
+    #     计算 ODE 导数 dp/dt = f_θ(p, z_v)
         
-        参数:
-            t: 当前时间点 (标量，ODE 求解器需要，但我们的动力学是时间无关的)
-            p: 当前提示状态，形状 (batch_size, n_ctx, prompt_dim)
+    #     参数:
+    #         t: 当前时间点 (标量，ODE 求解器需要，但我们的动力学是时间无关的)
+    #         p: 当前提示状态，形状 (batch_size, n_ctx, prompt_dim)
         
-        返回:
-            dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
-        """
-        if self.z_v is None:
-            raise RuntimeError("必须先调用 set_visual_feature() 设置视觉特征！")
+    #     返回:
+    #         dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
+    #     """
+    #     if self.z_v is None:
+    #         raise RuntimeError("必须先调用 set_visual_feature() 设置视觉特征！")
         
-        # p 的形状: (batch_size, n_ctx, prompt_dim)
-        # z_v 的形状: (batch_size, visual_dim)
+    #     # p 的形状: (batch_size, n_ctx, prompt_dim)
+    #     # z_v 的形状: (batch_size, visual_dim)
         
-        # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
-        # 扩展后形状: (batch_size, n_ctx, visual_dim)
-        z_v_expanded = self.z_v.unsqueeze(1).expand(-1, p.shape[1], -1)
+    #     # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
+    #     # 扩展后形状: (batch_size, n_ctx, visual_dim)
+    #     z_v_expanded = self.z_v.unsqueeze(1).expand(-1, p.shape[1], -1)
         
-        # 拼接: [p(t); z_v]
-        # 形状: (batch_size, n_ctx, prompt_dim + visual_dim)
-        inp = torch.cat([p, z_v_expanded], dim=-1)
+    #     # 拼接: [p(t); z_v]
+    #     # 形状: (batch_size, n_ctx, prompt_dim + visual_dim)
+    #     inp = torch.cat([p, z_v_expanded], dim=-1)
         
-        # Residual MLP 前向传播
-        x = self.input_proj(inp)
-        x = self.act(x) 
-        x = self.mlp(x)
-        # for block in self.res_blocks:
-        #     x = x + block(x)
+    #     # Residual MLP 前向传播
+    #     x = self.input_proj(inp)
+    #     x = self.act(x) 
+    #     x = self.mlp(x)
+    #     # for block in self.res_blocks:
+    #     #     x = x + block(x)
         
-        # 输出层
-        dp_dt = self.output_proj(x)
+    #     # 输出层
+    #     dp_dt = self.output_proj(x)
         
-        return dp_dt
+    #     return dp_dt
 
     def forward_ode_network(self, inp):
         """
@@ -223,8 +223,9 @@ class ODEFunc(nn.Module):
         # Residual MLP 前向传播
         x = self.input_proj(inp)
         x = self.act(x)
-        for block in self.res_blocks:
-            x = x + block(x)
+        x = self.mlp(x)
+        # for block in self.res_blocks:
+        #     x = x + block(x)
         
         # 输出层
         dp_dt = self.output_proj(x)
