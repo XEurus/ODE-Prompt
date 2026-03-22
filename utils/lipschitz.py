@@ -88,6 +88,7 @@ class FullReport:
     results: List[LipschitzResult]
     flow_map_lip: Optional[float] = None
     flow_map_empirical: Optional[float] = None
+    flow_map_empirical_avg: Optional[float] = None
     model_info: Dict = field(default_factory=dict)
 
     def best_upper(self) -> float:
@@ -590,7 +591,7 @@ def estimate_flow_lipschitz(ode_func: nn.Module,
                             z_v: torch.Tensor,
                             num_pairs: int = 50,
                             eps: float = 0.01,
-                            device: str = 'cuda') -> Tuple[float, List[float]]:
+                            device: str = 'cuda') -> Tuple[float, float, List[float]]:
     """
     直接估计 ODE 流映射 Φ_T 的 Lipschitz 常数。
 
@@ -638,7 +639,9 @@ def estimate_flow_lipschitz(ode_func: nn.Module,
             if diff_in > 1e-12:
                 ratios.append(diff_out / diff_in)
 
-    return max(ratios) if ratios else 0.0, ratios
+    max_ratio = max(ratios) if ratios else 0.0
+    avg_ratio = float(np.mean(ratios)) if ratios else 0.0
+    return max_ratio, avg_ratio, ratios
 
 
 # ================================================================
@@ -753,11 +756,16 @@ class ODELipschitzAnalyzer:
         # ------ ODE 流映射 ------
         flow_lip = None
         flow_empirical = None
+        flow_empirical_avg = None
         if run_flow:
             logger.info("估计 ODE 流映射利普希茨常数...")
             try:
-                flow_empirical, _ = estimate_flow_lipschitz(
+                flow_empirical, flow_empirical_avg, _ = estimate_flow_lipschitz(
                     self.ode_func, p_center, z_v_mean, device=self.device)
+                logger.info(
+                    f"ODE 流映射经验利普希茨: 最大={flow_empirical:.6f}, "
+                    f"平均={flow_empirical_avg:.6f}"
+                )
             except Exception as e:
                 logger.warning(f"流映射估计失败: {e}")
 
@@ -785,6 +793,7 @@ class ODELipschitzAnalyzer:
             results=results,
             flow_map_lip=flow_lip,
             flow_map_empirical=flow_empirical,
+            flow_map_empirical_avg=flow_empirical_avg if run_flow else None,
             model_info=model_info,
         )
 
@@ -853,7 +862,9 @@ class ODELipschitzAnalyzer:
                 else:
                     print(f"    理论上界 e^(L·T) = e^({L_f:.2f}) = {report.flow_map_lip:.4f}")
             if report.flow_map_empirical is not None:
-                print(f"    经验估计 (直接扰动): {report.flow_map_empirical:.4f}")
+                avg_str = (f", 平均={report.flow_map_empirical_avg:.4f}"
+                           if report.flow_map_empirical_avg is not None else "")
+                print(f"    经验估计 (直接扰动): 最大={report.flow_map_empirical:.4f}{avg_str}")
             print("    注: e^(L·T) 通常非常保守，实际流映射远小于此。")
 
         print(f"\n{sep}\n")
