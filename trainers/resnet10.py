@@ -703,18 +703,13 @@ class resnet10(TrainerX):
         max_batches = getattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES', 2)
         partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
         
-        # 1. 训练集对抗准确率
-        train_acc = None
-        if hasattr(self, 'train_pkl') and self.train_pkl is not None:
-            print(f'\n[1/2] Train Adversarial Accuracy:')
-            train_acc = self._eval_adv_embedding(
-                self.train_pkl,
-                self.train_loader_x_noshuffle,
-                max_batches=max_batches
-            )
+        # 1. 训练集对抗准确率 - 直接使用 run_epoch_adv 中统计的平均值（避免重新遍历）
+        train_acc = getattr(self, '_epoch_train_acc', None)
+        if train_acc is not None:
+            print(f'\n[1/2] Train Adversarial Accuracy (from training):')
             print(f"      Train Adv Acc: {train_acc:.2f}%")
         else:
-            print(f'\n[1/2] Train adversarial test skipped (train_pkl not prepared)')
+            print(f'\n[1/2] Train adversarial accuracy not available (no acc in loss_summary)')
         
         # 2. 验证集对抗准确率
         val_acc = None

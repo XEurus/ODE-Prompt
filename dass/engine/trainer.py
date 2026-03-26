@@ -425,8 +425,10 @@ class SimpleTrainer(TrainerBase):
         self.val_loader = dm.val_loader
         self.test_loader = dm.test_loader
 
-        # 不带归一化的训练 DataLoader（用于对抗攻击）
-        dm_notransform = DataManager(self.cfg, batch_size, adv='notransform_noshuffle')
+        # 不带归一化的训练 DataLoader（用于 PGD-bank 生成）
+        # 使用单独的 BATCH_PGD_SIZE，可以更大以充分利用显存
+        batch_size_pgd = getattr(self.cfg.DATALOADER.TRAIN_X, 'BATCH_PGD_SIZE', batch_size)
+        dm_notransform = DataManager(self.cfg, batch_size_pgd, adv='notransform_noshuffle')
         self.train_loader_x_notransform_noshuffle = dm_notransform.train_loader_x
         self.val_loader_notransform = dm_notransform.val_loader  # 验证集也使用 notransform
 
@@ -1408,6 +1410,10 @@ class TrainerX(SimpleTrainer):
         self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
         self.write_scalar("epoch_train/mix_clean_ratio", float(mix_clean_ratio), self.epoch + 1)
         self.write_scalar("epoch_train/use_data_mixing", 1.0 if use_data_mixing else 0.0, self.epoch + 1)
+
+        # 保存 epoch 级训练准确率，供 after_epoch 使用（避免重新评估）
+        if "acc" in losses.meters:
+            self._epoch_train_acc = losses.meters["acc"].avg
 
     def parse_batch_train(self, batch):
         input = batch["img"]

@@ -49,7 +49,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/clip')
+    model_path = clip._download(url, './clip')
 
     try:
         # loading JIT archive
@@ -111,14 +111,17 @@ class ODEFunc(nn.Module):
     网络设计:
         f_θ(p, z_v) = MLP_θ([p; z_v])  # 论文公式
         
-    为了处理 batch 维度的不匹配，我们采用以下策略:
-        - 在训练时，z_v 的 batch 均值作为全局视觉条件
-        - 这样 ODE 为所有类别生成统一的提示演化
+    支持的网络类型:
+        - mlp: 普通 MLP
+        - mlp_spectral: MLP + 谱归一化
+        - resnet: ResNet 块
+        - resnet_spectral: ResNet 块 + 谱归一化
     """
-    def __init__(self, prompt_dim, visual_dim):
+    def __init__(self, prompt_dim, visual_dim, network_type="mlp_spectral"):
         super(ODEFunc, self).__init__()
         self.prompt_dim = prompt_dim
         self.visual_dim = visual_dim
+        self.network_type = network_type
         
         # 视觉特征会被存储在这里，供 forward 使用
         # 这是因为 odeint 只允许 forward(t, x) 签名
@@ -129,39 +132,80 @@ class ODEFunc(nn.Module):
         #self.hidden_dim = 768
         self.hidden_dim = prompt_dim * 2
         
-        self.input_proj = spectral_norm(nn.Linear(prompt_dim + visual_dim, self.hidden_dim))
-        # self.norm_in = nn.LayerNorm(self.hidden_dim)
-        self.act = nn.GELU()
-
-        self.mlp = nn.Sequential(
-            spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),nn.GELU(),
-            spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),nn.GELU(),
-        ) # 使用谱归一化
+        # 根据网络类型构建网络
+        self._build_network(network_type)
         
+        print(f"[ODEFunc] Network type: {network_type}")
+        print(f"[ODEFunc] Input dim: {prompt_dim + visual_dim}, Hidden dim: {self.hidden_dim}, Output dim: {prompt_dim}")
+    
+    def _build_network(self, network_type):
+        """根据网络类型构建网络结构"""
+        use_spectral = "spectral" in network_type
+        use_resnet = "resnet" in network_type
+        
+        # 输入投影层
+        if use_spectral:
+            self.input_proj = spectral_norm(nn.Linear(self.prompt_dim + self.visual_dim, self.hidden_dim))
+        else:
+            self.input_proj = nn.Linear(self.prompt_dim + self.visual_dim, self.hidden_dim)
+        
+        self.act = nn.GELU()
+        
+        if use_resnet:
+            # ResNet 网络结构
+            self._build_resnet(use_spectral)
+        else:
+            # MLP 网络结构
+            self._build_mlp(use_spectral)
+        
+        # 输出投影层
+        if use_spectral:
+            self.output_proj = spectral_norm(nn.Linear(self.hidden_dim, self.prompt_dim))
+        else:
+            self.output_proj = nn.Linear(self.hidden_dim, self.prompt_dim)
+    
+    def _build_mlp(self, use_spectral):
+        """构建 MLP 网络"""
+        if use_spectral:
+            self.mlp = nn.Sequential(
+                spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)), nn.GELU(),
+                spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)), nn.GELU(),
+            )
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim), nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim), nn.GELU(),
+            )
+        # 残差块不用于 MLP 模式
+        self.res_blocks = nn.ModuleList()
+    
+    def _build_resnet(self, use_spectral):
+        """构建 ResNet 网络"""
+        # 不使用简单 MLP
+        self.mlp = nn.Identity()
+        
+        # 构建残差块
         self.res_blocks = nn.ModuleList()
         for _ in range(2):  # 2 个残差块
-            block = nn.Sequential(
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU()
-            )
-            # 关键修复：零初始化残差块的最后一层，确保初始时残差接近零
-            #nn.init.zeros_(block[3].weight)
-            #nn.init.zeros_(block[3].bias)
+            if use_spectral:
+                block = nn.Sequential(
+                    spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU(),
+                    spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU()
+                )
+            else:
+                block = nn.Sequential(
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU()
+                )
             self.res_blocks.append(block)
-        
-        # 输出投影（应用谱归一化约束 Lipschitz 常数）
-        self.output_proj = spectral_norm(nn.Linear(self.hidden_dim, prompt_dim))
-        
-        # 关键修复：使用极小的高斯初始化而不是全零
-        # 全零会导致 res_blocks 在初期梯度为0（梯度阻断）
-        # 极小值 (1e-5) 既能保证 ODE 初始接近恒等，又能打通梯度
-        # nn.init.zeros_(self.output_proj.weight)
-        # # nn.init.normal_(self.output_proj.weight, std=1e-5)
-        # nn.init.zeros_(self.output_proj.bias)
     
     def set_visual_feature(self, z_v):
         """
@@ -173,43 +217,6 @@ class ODEFunc(nn.Module):
         # 移除 batch 均值，保留每个样本的独立特征
         self.z_v = z_v  # (batch_size, visual_dim)
 
-    # def forward(self, t, p):
-    #     """
-    #     计算 ODE 导数 dp/dt = f_θ(p, z_v)
-        
-    #     参数:
-    #         t: 当前时间点 (标量，ODE 求解器需要，但我们的动力学是时间无关的)
-    #         p: 当前提示状态，形状 (batch_size, n_ctx, prompt_dim)
-        
-    #     返回:
-    #         dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
-    #     """
-    #     if self.z_v is None:
-    #         raise RuntimeError("必须先调用 set_visual_feature() 设置视觉特征！")
-        
-    #     # p 的形状: (batch_size, n_ctx, prompt_dim)
-    #     # z_v 的形状: (batch_size, visual_dim)
-        
-    #     # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
-    #     # 扩展后形状: (batch_size, n_ctx, visual_dim)
-    #     z_v_expanded = self.z_v.unsqueeze(1).expand(-1, p.shape[1], -1)
-        
-    #     # 拼接: [p(t); z_v]
-    #     # 形状: (batch_size, n_ctx, prompt_dim + visual_dim)
-    #     inp = torch.cat([p, z_v_expanded], dim=-1)
-        
-    #     # Residual MLP 前向传播
-    #     x = self.input_proj(inp)
-    #     x = self.act(x) 
-    #     x = self.mlp(x)
-    #     # for block in self.res_blocks:
-    #     #     x = x + block(x)
-        
-    #     # 输出层
-    #     dp_dt = self.output_proj(x)
-        
-    #     return dp_dt
-
     def forward_ode_network(self, inp):
         """
         核心 ODE 网络计算，不含 z_v 处理逻辑
@@ -220,12 +227,16 @@ class ODEFunc(nn.Module):
         返回:
             dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
         """
-        # Residual MLP 前向传播
+        # 输入投影 + 激活
         x = self.input_proj(inp)
         x = self.act(x)
+        
+        # MLP 或 Identity
         x = self.mlp(x)
-        # for block in self.res_blocks:
-        #     x = x + block(x)
+        
+        # ResNet 残差块 (如果有)
+        for block in self.res_blocks:
+            x = x + block(x)
         
         # 输出层
         dp_dt = self.output_proj(x)
@@ -303,10 +314,13 @@ class PromptLearner(nn.Module):
         # 关键修复：ODE 网络必须使用 float32 以保证数值稳定性
         # torchdiffeq 在 fp16 下会出现严重的数值问题
         # =========================================================
-        self.ode_func = ODEFunc(ctx_dim, visual_dim).float()  # 强制 float32
+        network_type = cfg.TRAINER.ADV.ODE_NETWORK_TYPE
+        self.ode_func = ODEFunc(ctx_dim, visual_dim, network_type).float()  # 强制 float32
         
-        # ODE 求解器参数
-        self.ode_t = torch.tensor([0.0, 1.0])  # 时间范围 [0, T]，T=1
+        # ODE 求解器参数 - 从配置读取 T 值
+        ode_t_end = cfg.TRAINER.ADV.ODE_T
+        self.ode_t = torch.tensor([0.0, ode_t_end])  # 时间范围 [0, T]
+        print(f"[ODE-Prompt] ODE time range: [0, {ode_t_end}]")
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -715,15 +729,18 @@ class AdvPT(TrainerX):
         label = batch["label"].to(self.device)
         use_loss_mix = 1
 
+        # 处理 DataParallel 包装的情况
+        model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
         # 计算对抗损失的嵌入
-        output_adv = self.model.forward_embedding(embedding_adv)
+        output_adv = model.forward_embedding(embedding_adv)
         loss_adv = torch.nn.CrossEntropyLoss()(output_adv, label)
 
         if use_loss_mix:
             # 计算与干净图像的损失（如果clean_pkl可用）
             #if 'images_clean' in batch_dict and batch_dict['images_clean'] is not None:
             embedding_clean = batch_dict['images_clean'].to(self.device)
-            output_clean = self.model.forward_embedding(embedding_clean)
+            output_clean = model.forward_embedding(embedding_clean)
             loss_clean = torch.nn.CrossEntropyLoss()(output_clean, label)
             # 1:1 比例混合
             loss = 0.4 * loss_adv + 0.6 * loss_clean
@@ -820,18 +837,13 @@ class AdvPT(TrainerX):
         max_batches = getattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES', 2)
         partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
         
-        # 1. 训练集对抗准确率
-        train_acc = None
-        if hasattr(self, 'train_pkl') and self.train_pkl is not None:
-            print(f'\n[1/2] Train Adversarial Accuracy:')
-            train_acc = self._eval_adv_embedding(
-                self.train_pkl,
-                self.train_loader_x_noshuffle,
-                max_batches=max_batches
-            )
+        # 1. 训练集对抗准确率 - 直接使用 run_epoch_adv 中统计的平均值（避免重新遍历）
+        train_acc = getattr(self, '_epoch_train_acc', None)
+        if train_acc is not None:
+            print(f'\n[1/2] Train Adversarial Accuracy (from training):')
             print(f"      Train Adv Acc: {train_acc:.2f}%")
         else:
-            print(f'\n[1/2] Train adversarial test skipped (train_pkl not prepared)')
+            print(f'\n[1/2] Train adversarial accuracy not available (no acc in loss_summary)')
         
         # 2. 验证集对抗准确率
         val_acc = None
