@@ -1033,13 +1033,21 @@ class AdvPT(TrainerX):
         参数:
             split: 数据集划分 ('test' or 'val')
             max_batches: 最多测试的 batch 数量（None 表示测试全部）
-            use_adv: 是否使用对抗样本
+            use_adv: 是否使用对抗样本（使用预计算的对抗 embedding 或图像）
         
         返回:
             准确率 (%)
+        
+        注意:
+            自动检测 test_pkl 的格式：
+            - [N, dim] (embedding) → forward_embedding（与训练一致）
+            - [N, 3, H, W] (图像) → model_inference（黑盒攻击兼容）
         """
         self.set_model_mode("eval")
         self.evaluator.reset()
+        
+        # 获取实际模型（处理 DataParallel 包装）
+        model = self.model.module if hasattr(self.model, 'module') else self.model
 
         if split is None:
             split = self.cfg.TEST.SPLIT
@@ -1050,38 +1058,42 @@ class AdvPT(TrainerX):
             split = "test"
             data_loader = self.test_loader
 
-        # 初始化归一化器（仅对抗测试时需要）
-        if use_adv:
-            if not hasattr(self, 'normalizer'):
-                self.normalizer = ImageNormalizer(device=self.device)
-            else:
-                self.normalizer.to(self.device)
-            test_eps = self.cfg.DATASET.TEST_EPS / 255.0
-            array_to_pkl = self.test_pkl
+        # 检测 test_pkl 的格式
+        is_embedding_format = False
+        if use_adv and hasattr(self, 'test_pkl') and self.test_pkl is not None:
+            # embedding: [N, dim], 图像: [N, 3, H, W]
+            is_embedding_format = (self.test_pkl.dim() == 2)
 
         # 打印测试信息
         batch_info = f"first {max_batches} batches" if max_batches else "all"
-        adv_info = "adversarial" if use_adv else "clean"
+        if use_adv:
+            adv_info = "adversarial (embedding)" if is_embedding_format else "adversarial (image)"
+        else:
+            adv_info = "clean"
         print(f"Evaluate {adv_info} on the *{split}* set ({batch_info})")
 
         for batch_idx, batch in enumerate(data_loader):
             if max_batches and batch_idx >= max_batches:
                 break
             
-            input, label = self.parse_batch_test(batch)
+            label = batch["label"].to(self.device)
             
             if use_adv:
-                # 获取对应的对抗样本
                 start_idx = batch_idx * data_loader.batch_size
-                end_idx = start_idx + input.shape[0]
-                input_adv = array_to_pkl[start_idx:end_idx].to(input.device)
+                end_idx = start_idx + label.shape[0]
+                adv_data = self.test_pkl[start_idx:end_idx].to(self.device)
                 
-                # 使用 normalizer 限制扰动
-                input_to_eval = self.normalizer.clamp_perturbation(input_adv, input, test_eps)
+                if is_embedding_format:
+                    # embedding 格式：直接用 forward_embedding
+                    output = model.forward_embedding(adv_data)
+                else:
+                    # 图像格式：用 model_inference（黑盒攻击兼容）
+                    output = self.model_inference(adv_data)
             else:
-                input_to_eval = input
+                # 干净测试：使用图像 + model_inference
+                input = batch["img"].to(self.device)
+                output = self.model_inference(input)
             
-            output = self.model_inference(input_to_eval)
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()

@@ -812,29 +812,47 @@ class SimpleTrainer(TrainerBase):
 
     def before_adv_test(self, path, attack='PGD'):
         """
-        对抗测试前的准备：生成测试集的对抗样本。
+        对抗测试前的准备：生成测试集的对抗嵌入。
         
-        流程（无来回归一化）：
+        修改后的流程（存储 embedding 而非完整图像）：
         1. 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
         2. PGD 攻击（攻击器内部归一化后传给网络）
-        3. 攻击结果归一化后保存（供 test_adv 使用）
+        3. 攻击结果归一化后提取 embedding 保存（与训练集一致）
+        
+        好处：
+        - 存储从 30GB (ImageNet) 降到 ~100MB
+        - 测试时使用 forward_embedding，与训练一致
         """
-        pkl_path = '{}/{}_{}_{}.pkl'.format(
+        # 使用新的文件名（与训练集的 _v2.pkl 对应）
+        pkl_path = '{}/{}_{}_test_v2.pkl'.format(
             path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"), attack
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
         )
         
-        # 初始化归一化器（保存为实例属性供 test_adv 使用）
-        self.normalizer = ImageNormalizer(device=self.device)
-        
         if os.path.isfile(pkl_path):
-            self.test_pkl = torch.load(pkl_path, weights_only=False)
+            self.test_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
+            print(f'[before_adv_test] Loaded test_pkl (embedding) from {pkl_path}')
             return
+        
+        print("[before_adv_test] Generating test adversarial embeddings...")
         
         # 使用不带归一化的测试 DataLoader
         data_loader = self.test_loader_notransform
-        self.test_pkl = torch.empty(size=[len(data_loader.dataset), 3, 224, 224])
+        normalizer = ImageNormalizer(device=self.device)
         test_eps = self.cfg.DATASET.TEST_EPS
+        
+        # 获取 image_encoder 用于提取特征
+        model = get_model(self.model)
+        image_encoder = model.image_encoder
+        image_encoder.to(self.device)
+        image_encoder.eval()
+        dtype = model.dtype
+        
+        embedding_dim = image_encoder.output_dim
+        print(f"[before_adv_test] Embedding dimension: {embedding_dim}")
+        
+        # 存储 embedding 而非完整图像
+        self.test_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
 
         if attack == 'PGD':
             temp_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
@@ -844,8 +862,9 @@ class SimpleTrainer(TrainerBase):
             
             surrogate = ClipModel(model=get_model(temp_model.visual), num_classes=2).eval().to(self.device)
             num_iters = getattr(self.cfg.DATASET, 'Test_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
-            attacker = create_pgd_attacker(test_eps, self.normalizer, self.cfg, num_iters=num_iters)
+            attacker = create_pgd_attacker(test_eps, normalizer, self.cfg, num_iters=num_iters)
             
+            print(f"[before_adv_test] Processing {len(data_loader)} batches...")
             for batch_idx, batch in enumerate(data_loader):
                 # 直接是 [0,1] 像素空间图像，无需反归一化
                 inputs_pixel = batch['img'].to(self.device)
@@ -858,13 +877,21 @@ class SimpleTrainer(TrainerBase):
                 assert torch.max(images_adv_pixel - inputs_pixel) < (eps_val + 1e-6)
                 assert torch.min(images_adv_pixel - inputs_pixel) > (-eps_val - 1e-6)
                 
-                # 归一化后保存（供 test_adv 使用）
-                images_adv_normalized = self.normalizer.normalize(images_adv_pixel)
+                # 归一化后提取 embedding
+                images_adv_normalized = normalizer.normalize(images_adv_pixel)
+                
+                with torch.no_grad():
+                    embedding = image_encoder(images_adv_normalized.type(dtype))
+                
                 start_idx = batch_idx * data_loader.batch_size
-                end_idx = start_idx + images_adv_normalized.shape[0]
-                self.test_pkl[start_idx:end_idx] = images_adv_normalized.cpu()
+                end_idx = start_idx + embedding.shape[0]
+                self.test_pkl[start_idx:end_idx] = embedding.cpu().float()
+                
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
             
             torch.save(self.test_pkl, pkl_path)
+            print(f'[before_adv_test] Generated and saved test_pkl to {pkl_path}')
             del surrogate
         else:
             raise ValueError(f"Unknown attack type: {attack}")
