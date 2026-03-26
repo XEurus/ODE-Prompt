@@ -16,7 +16,7 @@ NCTX=32                    # 提示token数量
 CSC=False                  # 类别特定上下文 (False/True)
 CTX_INIT=""                # 初始化词语 (空="a photo of a")
 CTP=end                    # 类别token位置 (end/middle/front)
-PREC=fp32                  # 计算精度 (fp16/fp32/amp)
+PREC=fp16                  # 计算精度 (fp16/fp32/amp)
 
 # ==================== ODE 网络配置 ====================
 # 网络类型: mlp, mlp_spectral, resnet, resnet_spectral
@@ -24,10 +24,10 @@ ODE_NETWORK_TYPE="resnet"
 ODE_T=1.0                  # ODE 时间范围 [0, T]
 
 # ==================== 攻击配置 ====================
-TRAIN_EPS=16               # 训练扰动强度 (eps/255)
-TEST_EPS=16                # 测试扰动强度
-TRAIN_PGD_ITERS=40         # 训练 PGD 迭代次数
-TEST_PGD_ITERS=40          # 测试 PGD 迭代次数
+TRAIN_EPS=5               # 训练扰动强度 (eps/255)
+TEST_EPS=1                # 测试扰动强度
+TRAIN_PGD_ITERS=5         # 训练 PGD 迭代次数
+TEST_PGD_ITERS=100          # 测试 PGD 迭代次数
 
 # ==================== 数据加载配置 ====================
 SUBSAMPLE_CLASSES="all"    # 子采样策略 (all/base/new)
@@ -39,7 +39,7 @@ Best_Model=${MODEL_FILE_PREFIX}-best.pth.tar
 
 # ==================== 实验配置 ====================
 exp_name="9_${ODE_NETWORK_TYPE}_T${ODE_T}_pgd${TRAIN_PGD_ITERS}-${TRAIN_EPS}"
-TRAINING_NOTE="${ODE_NETWORK_TYPE} T=${ODE_T} PGD${TRAIN_PGD_ITERS}-${TRAIN_EPS}"
+TRAINING_NOTE="尝试修改PGD迭代次数和扰动强度"
 
 D=$ROOT
 DIR=/autodl-fs/data/output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${exp_name}
@@ -79,8 +79,6 @@ TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
 TRAINER.ADV.ODE_NETWORK_TYPE ${ODE_NETWORK_TYPE} \
 TRAINER.ADV.ODE_T ${ODE_T} \
 DATASET.SUBSAMPLE_CLASSES ${SUBSAMPLE_CLASSES} \
-DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE ${BATCH_EMBEDDING_SIZE} \
-DATALOADER.TRAIN_X.BATCH_PGD_SIZE ${BATCH_PGD_SIZE} \
 DATASET.TRAIN_EPS ${TRAIN_EPS} \
 DATASET.TEST_EPS ${TEST_EPS} \
 DATASET.Train_PGD_NUM_ITERS ${TRAIN_PGD_ITERS} \

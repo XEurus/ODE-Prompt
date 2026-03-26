@@ -2,9 +2,9 @@ DATALOADER:
   TRAIN_X:
     BATCH_SIZE: 24
     BATCH_EMBEDDING_SIZE: 24
-    BATCH_PGD_SIZE: 64  # PGD-bank生成时的batch大小（可以更大）
+    BATCH_PGD_SIZE: 128  # PGD-bank生成时的batch大小（可以更大）
   TEST:
-    BATCH_SIZE: 32
+    BATCH_SIZE: 128
   NUM_WORKERS: 16
 
 INPUT:

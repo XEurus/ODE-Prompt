@@ -391,7 +391,7 @@ if __name__ == "__main__":
         # 路径配置
         "root": "/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data",
         "output_dir": "./output/oxford_pets/AdvPT/vit_b16/adv",
-        "path": "./pkl_data_mix_6/",
+        "path": "./pkl_data_mix_PGD5_1/",
         
         # 配置文件
         "config_file": "configs/trainers/AdvPT/vit_b16.yaml",
