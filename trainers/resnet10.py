@@ -971,6 +971,11 @@ class resnet10(TrainerX):
         return self._test_impl(split, max_batches=max_batches, use_adv=False)
 
     @torch.no_grad()
+    def test_adv(self, split=None):
+        """完整数据集对抗测试（使用预加载 pkl，自动识别 embedding/image 格式）"""
+        return self._test_impl(split, max_batches=None, use_adv=True)
+
+    @torch.no_grad()
     def test_adv_partial(self, split=None, max_batches=20):
         """部分数据集对抗测试"""
         return self._test_impl(split, max_batches=max_batches, use_adv=True)

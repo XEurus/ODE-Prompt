@@ -185,7 +185,7 @@ def extend_cfg(cfg):
     
     # ODE 网络配置
     # 网络类型: mlp, mlp_spectral, resnet, resnet_spectral
-    cfg.TRAINER.ADV.ODE_NETWORK_TYPE = "mlp_spectral"
+    cfg.TRAINER.ADV.ODE_NETWORK_TYPE = "resnet"
     cfg.TRAINER.ADV.ODE_T = 1.0                   # ODE 时间范围终点 T（从 0 积分到 T）
 
     # 数据集和数据加载配置
@@ -336,17 +336,18 @@ def main(args):
             print('Preparing adversarial training data...')
             print('=' * 60)
             
-            print('\n[1/4] Generating/Loading training adversarial embeddings...')
-            trainer.before_adv_train(path=args.path, attack='PGD')
-            
-            print('\n[2/4] Generating/Loading training clean embeddings (for mixed training)...')
+            attack_mode = args.white_attack
+            print('\n[1/4] Generating/Loading training clean embeddings (for mixed training)...')
             trainer.before_clean_train(path=args.path)
             
-            print('\n[3/4] Generating/Loading validation adversarial embeddings...')
-            trainer.before_adv_val(path=args.path, attack='PGD')
+            print(f'\n[2/4] Generating/Loading training adversarial embeddings ({attack_mode})...')
+            trainer.before_adv_train(path=args.path, attack=attack_mode)
             
-            print('\n[4/4] Generating/Loading test adversarial samples...')
-            trainer.before_adv_test(path=args.path, attack='PGD')
+            print(f'\n[3/4] Generating/Loading validation adversarial embeddings ({attack_mode})...')
+            trainer.before_adv_val(path=args.path, attack=attack_mode)
+            
+            print(f'\n[4/4] Generating/Loading test adversarial samples ({attack_mode})...')
+            trainer.before_adv_test(path=args.path, attack=attack_mode)
             
             print('=' * 60)
             print('Starting adversarial training...')

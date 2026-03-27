@@ -29,7 +29,7 @@ def parse_args():
         help="包含模型文件的 prompt_learner 目录",
     )
 
-    parser.add_argument("--root", type=str, default="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data")
+    parser.add_argument("--root", type=str, default="/autodl-fs/data/Data")
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--seed", type=int, default=1)
@@ -113,9 +113,12 @@ def eval_adv_embedding_full(trainer, embedding_pkl, data_loader, split_name):
 def get_required_pkl_paths(cfg, pkl_root: Path, attack: str):
     dataset_name = cfg.DATASET.NAME
     backbone_name = cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+    # PGD_whitebox 的 test embedding 由 before_adv_test 在线生成/缓存，
+    # 不依赖旧的全图 pkl；这里回退到检查基础 PGD.pkl（仅用于兼容断言）
+    base_attack = attack.replace('_whitebox', '')
     return {
         "clean": pkl_root / f"{dataset_name}_{backbone_name}_clean.pkl",
-        "test": pkl_root / f"{dataset_name}_{backbone_name}_{attack}.pkl",
+        "test": pkl_root / f"{dataset_name}_{backbone_name}_{base_attack}.pkl",
         "train": pkl_root / f"{dataset_name}_{backbone_name}_v2.pkl",
         "val": pkl_root / f"{dataset_name}_{backbone_name}_val_v2.pkl",
     }
