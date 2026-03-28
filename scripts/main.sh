@@ -30,6 +30,7 @@ TRAIN_PGD_ITERS=5         # 训练 PGD 迭代次数
 TEST_PGD_ITERS=100          # 测试 PGD 迭代次数
 
 # ==================== 数据加载配置 ====================
+NUM_SHOTS=16               # Few-shot: 每类训练样本数 (-1=全部)
 SUBSAMPLE_CLASSES="all"    # 子采样策略 (all/base/new)
 
 # ==================== 模型文件配置 ====================
@@ -78,6 +79,7 @@ TRAINER.ADV.PREC ${PREC} \
 TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
 TRAINER.ADV.ODE_NETWORK_TYPE ${ODE_NETWORK_TYPE} \
 TRAINER.ADV.ODE_T ${ODE_T} \
+DATASET.NUM_SHOTS ${NUM_SHOTS} \
 DATASET.SUBSAMPLE_CLASSES ${SUBSAMPLE_CLASSES} \
 DATASET.TRAIN_EPS ${TRAIN_EPS} \
 DATASET.TEST_EPS ${TEST_EPS} \

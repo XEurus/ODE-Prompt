@@ -398,16 +398,23 @@ class PromptLearner(nn.Module):
             # 通过 ODE 网络计算 dp/dt
             return self.ode_func.forward_ode_network(inp)
         
-        p_trajectory = odeint_adjoint(
-            ode_func_closure,   # 使用闭包函数，捕获了正确的 z_v
-            p0_float,           # 初始状态 p(0)，float32
-            t,                  # 时间点 [0, 1]
-            method='dopri5',    # Dormand-Prince 5 (自适应步长)
-            rtol=1e-3,          # 放宽容差以提高数值稳定性
-            atol=1e-4,          
-            options={'min_step': 1e-5},  # 适当的最小步长
-            adjoint_params=tuple(self.ode_func.parameters()) # 关键修复：因为闭包不是 nn.Module，必须显式指定需要求导的参数
+        ode_solver_kwargs = dict(
+            method='dopri5',
+            rtol=1e-3,
+            atol=1e-4,
+            options={'min_step': 1e-5},
         )
+
+        if getattr(self, 'use_standard_odeint', False):
+            p_trajectory = odeint(
+                ode_func_closure, p0_float, t, **ode_solver_kwargs
+            )
+        else:
+            p_trajectory = odeint_adjoint(
+                ode_func_closure, p0_float, t,
+                **ode_solver_kwargs,
+                adjoint_params=tuple(self.ode_func.parameters())
+            )
         
         # 取终端状态 p(T)
         # 形状: (batch_size, n_ctx, prompt_dim)

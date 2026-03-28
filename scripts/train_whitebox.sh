@@ -33,8 +33,11 @@ TEST_EPS=1                   # 测试扰动强度 (x/255)
 TRAIN_PGD_ITERS=5            # 训练 PGD 迭代次数
 TEST_PGD_ITERS=100           # 测试 PGD 迭代次数
 
+# ==================== 数据加载配置 ====================
+NUM_SHOTS=16                 # Few-shot: 每类训练样本数 (-1=全部)
+
 # ==================== 实验配置 ====================
-exp_name="10_whitebox_${ODE_NETWORK_TYPE}_pgd${TRAIN_PGD_ITERS}_eps${TRAIN_EPS}"
+exp_name="10_whitebox_16shot_${ODE_NETWORK_TYPE}_pgd${TRAIN_PGD_ITERS}_eps${TRAIN_EPS}_adamw"
 TRAINING_NOTE="白盒分类PGD训练: train=PGD${TRAIN_PGD_ITERS}-${TRAIN_EPS}/255, test=PGD${TEST_PGD_ITERS}-${TEST_EPS}/255"
 
 # 模型文件
@@ -43,7 +46,7 @@ MODEL_FILE=${MODEL_FILE_PREFIX}.pth.tar
 Best_Model=${MODEL_FILE_PREFIX}-best.pth.tar
 
 # pkl 数据目录（白盒攻击生成的 embedding 单独存放）
-PKL_DIR=./pkl_whitebox_pgd${TRAIN_PGD_ITERS}_eps${TRAIN_EPS}
+PKL_DIR=./pkl_whitebox_pgd${TRAIN_PGD_ITERS}_eps${TRAIN_EPS}_${NUM_SHOTS}shot
 
 D=$ROOT
 DIR=/autodl-fs/data/output/${DATASET}/${TRAINER}/${BACKBONE}/adv/${exp_name}
@@ -93,6 +96,7 @@ TRAINER.ADV.PREC ${PREC} \
 TRAINER.ADV.CLASS_TOKEN_POSITION ${CTP} \
 TRAINER.ADV.ODE_NETWORK_TYPE ${ODE_NETWORK_TYPE} \
 TRAINER.ADV.ODE_T ${ODE_T} \
+DATASET.NUM_SHOTS ${NUM_SHOTS} \
 DATASET.TRAIN_EPS ${TRAIN_EPS} \
 DATASET.TEST_EPS ${TEST_EPS} \
 DATASET.Train_PGD_NUM_ITERS ${TRAIN_PGD_ITERS} \

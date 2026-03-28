@@ -115,7 +115,7 @@ def get_required_pkl_paths(cfg, pkl_root: Path, attack: str):
     backbone_name = cfg.MODEL.BACKBONE.NAME.replace("/", "_")
     # PGD_whitebox 的 test embedding 由 before_adv_test 在线生成/缓存，
     # 不依赖旧的全图 pkl；这里回退到检查基础 PGD.pkl（仅用于兼容断言）
-    base_attack = attack.replace('_whitebox', '')
+    base_attack = attack.replace('_whitebox', '').replace('_adaptive', '')
     return {
         "clean": pkl_root / f"{dataset_name}_{backbone_name}_clean.pkl",
         "test": pkl_root / f"{dataset_name}_{backbone_name}_{base_attack}.pkl",

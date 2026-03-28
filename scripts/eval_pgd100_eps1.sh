@@ -5,6 +5,7 @@
 # 攻击模式说明：
 #   PGD          — 特征扰动攻击（旧方式，用随机代理模型，攻击力弱）
 #   PGD_whitebox — 白盒分类攻击（标准评测，直接最大化零样本分类 CE loss）
+#   PGD_adaptive — 自适应攻击（梯度穿过完整 ODE 模型，最强攻击）
 #
 # 流程：
 #   1. 创建新 pkl 目录，复用已有 clean/train/val embedding
@@ -21,7 +22,7 @@ BACKBONE=vit_b16
 TRAINER=AdvPT
 
 # ==================== 可调参数 ====================
-ATTACK_MODE=PGD_whitebox   # PGD | PGD_whitebox
+ATTACK_MODE=PGD_whitebox   # PGD | PGD_whitebox | PGD_adaptive
 TEST_EPS=1                 # 扰动强度 (x/255)
 PGD_ITERS=100              # PGD 迭代次数
 

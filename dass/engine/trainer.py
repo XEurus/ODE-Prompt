@@ -573,6 +573,13 @@ class SimpleTrainer(TrainerBase):
                     self.clean_pkl = self.clean_pkl.repeat_interleave(num_restarts, dim=0)
                     print(f"[_expand] Expanded clean_pkl to {self.clean_pkl.shape}")
 
+    def _pkl_shots_suffix(self):
+        """返回 few-shot pkl 文件名后缀，全量数据时返回空字符串"""
+        num_shots = getattr(self.cfg.DATASET, 'NUM_SHOTS', -1)
+        if num_shots >= 1:
+            return f'_shot{num_shots}'
+        return ''
+
     def before_adv_train(self, path, attack='PGD'):
         """
         对抗训练前的准备：生成或加载对抗样本特征。
@@ -581,9 +588,10 @@ class SimpleTrainer(TrainerBase):
           - 'PGD':          特征扰动攻击（代理模型 + KL 散度）
           - 'PGD_whitebox':  白盒分类攻击（直接最大化 CLIP 零样本交叉熵）
         """
-        pkl_path = '{}/{}_{}_v2.pkl'.format(
+        pkl_path = '{}/{}_{}{}_v2.pkl'.format(
             path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
+            self._pkl_shots_suffix()
         )
         
         if os.path.isfile(pkl_path):
@@ -651,7 +659,7 @@ class SimpleTrainer(TrainerBase):
             attack_encoder = temp_model.visual
 
             eps_val = train_eps / 255.0
-            alpha = eps_val / num_iters * 2.5
+            alpha = eps_val / num_iters * 1.5
 
             print(f"[before_adv_train] eps={eps_val:.6f} ({train_eps}/255), iters={num_iters}, "
                   f"restarts={num_restarts}, batches={len(data_loader)}")
@@ -710,9 +718,10 @@ class SimpleTrainer(TrainerBase):
         1. 使用不带归一化的 DataLoader 获取 [0,1] 像素空间图像
         2. 归一化后提取特征（无攻击）
         """
-        pkl_path = '{}/{}_{}_clean.pkl'.format(
+        pkl_path = '{}/{}_{}{}_clean.pkl'.format(
             path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
+            self._pkl_shots_suffix()
         )
         
         if os.path.isfile(pkl_path):
@@ -769,9 +778,10 @@ class SimpleTrainer(TrainerBase):
         
         支持 'PGD'（特征扰动）和 'PGD_whitebox'（白盒分类攻击）
         """
-        pkl_path = '{}/{}_{}_val_v2.pkl'.format(
+        pkl_path = '{}/{}_{}{}_val_v2.pkl'.format(
             path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
+            self._pkl_shots_suffix()
         )
         
         if os.path.isfile(pkl_path):

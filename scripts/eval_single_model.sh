@@ -19,13 +19,13 @@ PYTHON="./dassl/bin/python"
 
 # ==================== 可调参数（可通过环境变量覆盖） ====================
 # 模型文件的完整路径
-MODEL_PATH=${MODEL_PATH:-"/autodl-fs/data/output/oxford_pets/AdvPT/vit_b16/adv/10_whitebox_resnet_pgd5_eps5/prompt_learner/model-best.pth.tar"}
+MODEL_PATH=${MODEL_PATH:-"/autodl-fs/data/output/oxford_pets/AdvPT/vit_b16/adv/10_whitebox_16shot_resnet_pgd5_eps5_adamw/prompt_learner/model-best.pth.tar"}
 
 # pkl 数据目录（需包含 test_v2_whitebox.pkl，或会自动生成）
 PKL_DIR=${PKL_DIR:-"./pkl_whitebox_pgd5_eps5"}
 
 # 攻击参数
-ATTACK_MODE=${ATTACK_MODE:-"PGD_whitebox"}   # PGD | PGD_whitebox
+ATTACK_MODE=${ATTACK_MODE:-"PGD_whitebox"}   # PGD | PGD_whitebox | PGD_adaptive
 TEST_EPS=${TEST_EPS:-1}                       # 扰动强度 (x/255)
 PGD_ITERS=${PGD_ITERS:-100}                   # PGD 迭代次数
 
