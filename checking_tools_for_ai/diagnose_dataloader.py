@@ -39,7 +39,7 @@ def extend_cfg(cfg):
     cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256
     cfg.DATASET.TRAIN_EPS = 16
     cfg.DATASET.TEST_EPS = 16
-    cfg.DATASET.PGD_NUM_ITERS = 40
+    cfg.DATASET.PGD_NUM_ITERS = 60
     cfg.MODEL.FILE_PREFIX = "model"
 
 

@@ -1,7 +1,8 @@
 DATALOADER:
   TRAIN_X:
-    BATCH_SIZE: 24
-    BATCH_EMBEDDING_SIZE: 24
+    BATCH_SIZE: 8
+    BATCH_EMBEDDING_SIZE: 8
+    BATCH_PGD_SIZE: 32  # PGD-bank生成时的batch大小（可以更大）
   TEST:
     BATCH_SIZE: 32
   NUM_WORKERS: 16
@@ -13,14 +14,14 @@ INPUT:
   PIXEL_STD: [0.26862954, 0.26130258, 0.27577711]
   TRANSFORMS: ["random_resized_crop", "random_flip", "normalize"]
 
-# OPTIM:
-#   NAME: "adamw"
-#   LR: 0.0001
-#   MAX_EPOCH: 100
-#   LR_SCHEDULER: "cosine"
-#   WARMUP_EPOCH: 5
-#   WARMUP_TYPE: "constant"
-#   WARMUP_CONS_LR: 1e-5
+OPTIM:
+  NAME: "adamw"
+  LR: 0.0001
+  MAX_EPOCH: 5
+  LR_SCHEDULER: "cosine"
+  WARMUP_EPOCH: -1
+  WARMUP_TYPE: "constant"
+  WARMUP_CONS_LR: 1e-5
 # OPTIM:
 #   NAME: "sgd"
 #   LR: 0.0001
@@ -33,21 +34,21 @@ INPUT:
 #   PLATEAU_MIN_LR: 1e-6
 #   WARMUP_EPOCH: -1  # plateau 不支持 warmup
 
-OPTIM: # 48.8
-  NAME: "adamw"
-  LR: 0.0001  # 初始学习率
-  MAX_EPOCH: 60  # 最大训练轮数
-  LR_SCHEDULER: "plateau"  # 学习率调度器类型
-  PLATEAU_MODE: "min"  # 监控指标最小化模式
-  PLATEAU_FACTOR: 0.5  # 衰减因子：当性能不再提升时，学习率乘以0.1（即降低到原来的10%）
-  PLATEAU_PATIENCE: 5  # 耐心值：连续5个epoch无改善则触发衰减
-  PLATEAU_THRESHOLD: 1e-4  # 阈值：改善幅度小于此值视为无改善
-  PLATEAU_MIN_LR: 1e-7  # 最小学习率下限
-  WARMUP_EPOCH: -1  # plateau调度器不支持warmup
+# OPTIM: # 48.8
+#   NAME: "adamw"
+#   LR: 0.0001  # 初始学习率
+#   MAX_EPOCH: 5  # 最大训练轮数
+#   LR_SCHEDULER: "plateau"  # 学习率调度器类型
+#   PLATEAU_MODE: "min"  # 监控指标最小化模式
+#   PLATEAU_FACTOR: 0.5  # 衰减因子：当性能不再提升时，学习率乘以0.1（即降低到原来的10%）
+#   PLATEAU_PATIENCE: 5  # 耐心值：连续5个epoch无改善则触发衰减
+#   PLATEAU_THRESHOLD: 1e-4  # 阈值：改善幅度小于此值视为无改善
+#   PLATEAU_MIN_LR: 1e-7  # 最小学习率下限
+#   WARMUP_EPOCH: -1  # plateau调度器不支持warmup
 
 TRAIN:
   PRINT_FREQ: 5
-  CHECKPOINT_FREQ: 3  # 每10个epoch保存一次检查点
+  CHECKPOINT_FREQ: 1  # 每10个epoch保存一次检查点
   MIX_CLEAN_RATIO: 0.0 # 干净数据混合比例 (0.0=纯对抗, 1.0=纯干净, 0.5=各50%)
   # TENSORBOARD_DIR: "/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/output/ucf101/AdvPT/vit_b16"
 

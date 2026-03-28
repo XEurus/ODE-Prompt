@@ -7,6 +7,8 @@ __pycache__/
 *.so
 *.jpg
 # Distribution / packaging
+8_adamw-pla_1e4_resnet_10/
+pkl*
 .Python
 build/
 develop-eggs/

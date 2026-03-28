@@ -304,20 +304,31 @@ class TrainerBase:
         else:
             self._writer.add_scalar(tag, scalar_value, global_step)
 
-    def train(self, start_epoch, max_epoch, path=None, adv_training=False):
+    def train(self, start_epoch, max_epoch, path=None, adv_training=False, realtime_adv=False):
         """
         通用的训练循环。
+        
+        参数:
+            start_epoch: 起始 epoch
+            max_epoch: 最大 epoch 数
+            path: pkl 数据路径
+            adv_training: 是否使用对抗训练（预计算 bank）
+            realtime_adv: 是否使用实时对抗训练（每 batch 实时 PGD）
         """
         self.start_epoch = start_epoch
         self.max_epoch = max_epoch
+        self.realtime_adv = realtime_adv  # 保存到实例变量
         print("adv_training: ", adv_training)
+        print("realtime_adv: ", realtime_adv)
         self.before_train()
         # if adv_training:
         #     # 如果是对抗训练，进行预处理（例如生成对抗样本）
         #     self.before_adv_train(path=path)
         for self.epoch in range(self.start_epoch, self.max_epoch):
             self.before_epoch() # 每个epoch前的钩子
-            if adv_training:
+            if realtime_adv:
+                self.run_epoch_realtime_adv()  # 运行实时对抗训练的 epoch
+            elif adv_training:
                 self.run_epoch_adv() # 运行对抗训练的epoch
             else:
                 self.run_epoch() # 运行普通训练的epoch
@@ -425,8 +436,10 @@ class SimpleTrainer(TrainerBase):
         self.val_loader = dm.val_loader
         self.test_loader = dm.test_loader
 
-        # 不带归一化的训练 DataLoader（用于对抗攻击）
-        dm_notransform = DataManager(self.cfg, batch_size, adv='notransform_noshuffle')
+        # 不带归一化的训练 DataLoader（用于 PGD-bank 生成）
+        # 使用单独的 BATCH_PGD_SIZE，可以更大以充分利用显存
+        batch_size_pgd = getattr(self.cfg.DATALOADER.TRAIN_X, 'BATCH_PGD_SIZE', batch_size)
+        dm_notransform = DataManager(self.cfg, batch_size_pgd, adv='notransform_noshuffle')
         self.train_loader_x_notransform_noshuffle = dm_notransform.train_loader_x
         self.val_loader_notransform = dm_notransform.val_loader  # 验证集也使用 notransform
 
@@ -474,11 +487,16 @@ class SimpleTrainer(TrainerBase):
             print(f"Detected {device_count} GPUs (use nn.DataParallel)")
             self.model = nn.DataParallel(self.model)
 
-    def train(self,path=None, adv_training=False):
+    def train(self,path=None, adv_training=False, realtime_adv=False):
         """
         调用父类的train方法开始训练。
+        
+        参数:
+            path: pkl 数据路径
+            adv_training: 是否使用对抗训练（预计算 bank）
+            realtime_adv: 是否使用实时对抗训练
         """
-        super().train(self.start_epoch, self.max_epoch, path=path, adv_training=adv_training)
+        super().train(self.start_epoch, self.max_epoch, path=path, adv_training=adv_training, realtime_adv=realtime_adv)
 
     def before_train(self):
         """
@@ -542,16 +560,14 @@ class SimpleTrainer(TrainerBase):
 
     def _expand_dataset_and_pkl(self):
         """
-        如果在 before_adv_train 中生成或加载的 train_pkl 包含多个 restart，
-        将其展平为 [5N, dim]，并同步扩展所有相关的 DataLoader 的 data_source。
-        这样在训练时可以直接把 [5N, C, H, W] 作为常规的数据流进行处理，而不需要在 batch 内展开。
+        如果 train_pkl 包含多个 restart [N, R, dim]，将其展平为 [N*R, dim]，
+        并同步扩展 DataLoader 的 data_source 和 clean_pkl。
         """
         if hasattr(self, 'train_pkl') and self.train_pkl.dim() == 3:
             N, num_restarts, dim = self.train_pkl.shape
             self.train_pkl = self.train_pkl.view(-1, dim)
-            print(f"[before_adv_train] Flattened train_pkl to {self.train_pkl.shape}")
+            print(f"[_expand] Flattened train_pkl to {self.train_pkl.shape}")
             
-            # 扩展相关 dataloader 的 dataset
             loaders = [
                 getattr(self, 'train_loader_x', None),
                 getattr(self, 'train_loader_x_noshuffle', None),
@@ -566,20 +582,32 @@ class SimpleTrainer(TrainerBase):
                     loader.dataset.data_source = new_data_source
             
             if loaders[1] is not None:
-                print(f"[before_adv_train] Expanded dataset lengths to {len(loaders[1].dataset.data_source)}")
+                print(f"[_expand] Expanded dataset to {len(loaders[1].dataset.data_source)}")
+
+            if hasattr(self, 'clean_pkl') and self.clean_pkl is not None:
+                if self.clean_pkl.shape[0] == N:
+                    self.clean_pkl = self.clean_pkl.repeat_interleave(num_restarts, dim=0)
+                    print(f"[_expand] Expanded clean_pkl to {self.clean_pkl.shape}")
+
+    def _pkl_shots_suffix(self):
+        """返回 few-shot pkl 文件名后缀，全量数据时返回空字符串"""
+        num_shots = getattr(self.cfg.DATASET, 'NUM_SHOTS', -1)
+        if num_shots >= 1:
+            return f'_shot{num_shots}'
+        return ''
 
     def before_adv_train(self, path, attack='PGD'):
         """
         对抗训练前的准备：生成或加载对抗样本特征。
         
-        流程（无来回归一化）：
-        1. 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
-        2. PGD 攻击（攻击器内部归一化后传给网络）
-        3. 攻击结果归一化后提取特征
+        支持两种攻击模式：
+          - 'PGD':          特征扰动攻击（代理模型 + KL 散度）
+          - 'PGD_whitebox':  白盒分类攻击（直接最大化 CLIP 零样本交叉熵）
         """
-        pkl_path = '{}/{}_{}_v2.pkl'.format(
+        pkl_path = '{}/{}_{}{}_v2.pkl'.format(
             path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
+            self._pkl_shots_suffix()
         )
         
         if os.path.isfile(pkl_path):
@@ -588,86 +616,114 @@ class SimpleTrainer(TrainerBase):
             self._expand_dataset_and_pkl()
             return
         
-        print("[before_adv_train] Generating adversarial embeddings...")
-        
-        # 统一的归一化器（攻击器内部和外部使用相同参数）
         normalizer = ImageNormalizer(device=self.device)
         train_eps = self.cfg.DATASET.TRAIN_EPS
+        num_iters = getattr(self.cfg.DATASET, 'Train_PGD_NUM_ITERS', 60)
+        num_restarts = getattr(self.cfg.DATASET, 'Train_PGD_NUM_RESTARTS', 10)
         
-        # 获取模型组件
         model = get_model(self.model)
         image_encoder = model.image_encoder
-        image_encoder.to(self.device) # 确保 image_encoder 在 GPU 上
+        image_encoder.to(self.device)
+        image_encoder.eval()
         dtype = model.dtype
         
-        # 构建代理模型
-        clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
-        if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
-            raise NotImplementedError("fp32/amp not supported for surrogate model")
-        surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
+        embedding_dim = image_encoder.output_dim
+        data_loader = self.train_loader_x_notransform_noshuffle
+        self.train_pkl = torch.empty(size=[len(data_loader.dataset), num_restarts, embedding_dim])
 
         if attack == 'PGD':
-            # 攻击器使用相同的 normalizer，内部会归一化后传给网络
-            num_iters = getattr(self.cfg.DATASET, 'Train_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
-            num_restarts = getattr(self.cfg.DATASET, 'Train_PGD_NUM_RESTARTS', 10)
+            print("[before_adv_train] Mode: feature-distortion PGD (surrogate)")
+            clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
+            if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
+                raise NotImplementedError("fp32/amp not supported for surrogate model")
+            surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
             attacker = create_pgd_attacker(train_eps, normalizer, self.cfg, num_iters=num_iters, num_restarts=num_restarts)
-            print(f"[before_adv_train] Using PGD attack with eps={train_eps}/255, iters={num_iters}, restarts={num_restarts}")
+
+            print(f"[before_adv_train] eps={train_eps}/255, iters={num_iters}, "
+                  f"restarts={num_restarts}, batches={len(data_loader)}")
+            for batch_idx, batch in enumerate(data_loader):
+                inputs_pixel = batch['img'].to(self.device)
+                images_adv_pixel_all = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc', return_all=True)
+
+                images_adv_normalized_flat = normalizer.normalize(images_adv_pixel_all)
+                with torch.no_grad():
+                    embedding_flat = image_encoder(images_adv_normalized_flat.type(dtype))
+
+                bs = inputs_pixel.shape[0]
+                embedding = embedding_flat.view(bs, num_restarts, -1)
+                start_idx = batch_idx * data_loader.batch_size
+                end_idx = start_idx + embedding.shape[0]
+                self.train_pkl[start_idx:end_idx] = embedding.cpu().float()
+
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
+
+            del surrogate
+
+        elif attack == 'PGD_whitebox':
+            print("[before_adv_train] Mode: white-box classification PGD")
+            temp_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device=self.device)
+            temp_model.float().eval()
+
+            classnames = [self.lab2cname[i] for i in range(len(self.lab2cname))]
+            prompts_text = [f"a photo of a {c.replace('_', ' ')}." for c in classnames]
+            tokens = clip.tokenize(prompts_text).to(self.device)
+            with torch.no_grad():
+                text_features = temp_model.encode_text(tokens).float()
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logit_scale = temp_model.logit_scale.exp().detach()
+            attack_encoder = temp_model.visual
+
+            eps_val = train_eps / 255.0
+            alpha = eps_val / num_iters * 1.5
+
+            print(f"[before_adv_train] eps={eps_val:.6f} ({train_eps}/255), iters={num_iters}, "
+                  f"restarts={num_restarts}, batches={len(data_loader)}")
+
+            for batch_idx, batch in enumerate(data_loader):
+                images = batch['img'].to(self.device).float()
+                labels = batch['label'].to(self.device)
+                bs = images.shape[0]
+
+                restart_embeddings = []
+                for _r in range(num_restarts):
+                    delta = torch.zeros_like(images).uniform_(-eps_val, eps_val)
+                    delta = torch.clamp(images + delta, 0, 1) - images
+
+                    for _ in range(num_iters):
+                        delta.requires_grad_(True)
+                        adv_norm = normalizer.normalize(images + delta)
+                        feats = attack_encoder(adv_norm).float()
+                        feats_n = feats / feats.norm(dim=-1, keepdim=True)
+                        logits = logit_scale * feats_n @ text_features.T
+                        loss = F.cross_entropy(logits, labels)
+                        loss.backward()
+                        grad = delta.grad.detach().sign()
+                        delta = (delta.detach() + alpha * grad).clamp(-eps_val, eps_val)
+                        delta = torch.clamp(images + delta, 0, 1) - images
+
+                    adv_final = (images + delta.detach()).clamp(0, 1)
+                    adv_normalized = normalizer.normalize(adv_final)
+                    with torch.no_grad():
+                        emb = image_encoder(adv_normalized.type(dtype))
+                    restart_embeddings.append(emb.cpu().float())
+
+                embedding = torch.stack(restart_embeddings, dim=1)
+                start_idx = batch_idx * data_loader.batch_size
+                end_idx = start_idx + bs
+                self.train_pkl[start_idx:end_idx] = embedding
+
+                if (batch_idx + 1) % 5 == 0:
+                    print(f"  [{batch_idx + 1}/{len(data_loader)}] done")
+
+            del temp_model
+
         else:
             raise ValueError(f"Unknown attack type: {attack}")
 
-        embedding_dim = image_encoder.output_dim
-        print(f"[before_adv_train] Embedding dimension: {embedding_dim}")
-        
-        # 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
-        data_loader = self.train_loader_x_notransform_noshuffle
-        # 存储所有 restart 的对抗特征，用于数据增强 [N, num_restarts, dim]
-        self.train_pkl = torch.empty(size=[len(data_loader.dataset), num_restarts, embedding_dim])
-        
-        # 确保 image_encoder 在 eval 模式
-        image_encoder.eval()
-        
-        print(f"[before_adv_train] Processing {len(data_loader)} batches...")
-        for batch_idx, batch in enumerate(data_loader):
-            # 直接是 [0,1] 像素空间图像，无需反归一化
-            inputs_pixel = batch['img'].to(self.device)
-            
-            # PGD 攻击（攻击器内部会归一化后传给网络）
-            # 设置 return_all=True，返回的是 [bs * num_restarts, C, H, W] 像素空间的对抗样本
-            images_adv_pixel_all = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc', return_all=True)
-            
-            # 验证扰动范围 (针对所有样本)
-            eps_val = train_eps / 255.
-            # 需要先将 inputs_pixel 复制 num_restarts 份以匹配维度用于差值计算
-            # [bs, C, H, W] -> [bs, num_restarts, C, H, W] -> [bs * num_restarts, C, H, W]
-            inputs_pixel_repeated = inputs_pixel.unsqueeze(1).repeat(1, num_restarts, 1, 1, 1).view(-1, *inputs_pixel.shape[1:])
-            
-            diff = images_adv_pixel_all - inputs_pixel_repeated
-            assert torch.max(diff) < (eps_val + 1e-6)
-            assert torch.min(diff) > (-eps_val - 1e-6)
-            
-            # 由于已经是展平的，直接归一化并提取特征
-            images_adv_normalized_flat = normalizer.normalize(images_adv_pixel_all)
-            
-            with torch.no_grad():
-                embedding_flat = image_encoder(images_adv_normalized_flat.type(dtype))
-                
-            # 恢复形状 [bs, num_restarts, dim] 以按原来的方式保存到 [N, num_restarts, dim]
-            # 之后再统一展平
-            bs = inputs_pixel.shape[0]
-            embedding = embedding_flat.view(bs, num_restarts, -1)
-
-            start_idx = batch_idx * data_loader.batch_size
-            end_idx = start_idx + embedding.shape[0]
-            self.train_pkl[start_idx:end_idx] = embedding.cpu().float()
-            
-            if (batch_idx + 1) % 10 == 0:
-                print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
-
         torch.save(self.train_pkl, pkl_path)
-        print(f'[before_adv_train] Generated and saved train_pkl to {pkl_path}')
-        del surrogate
+        print(f'[before_adv_train] Saved to {pkl_path}')
         torch.cuda.empty_cache()
-        
         self._expand_dataset_and_pkl()
 
     def before_clean_train(self, path):
@@ -678,9 +734,10 @@ class SimpleTrainer(TrainerBase):
         1. 使用不带归一化的 DataLoader 获取 [0,1] 像素空间图像
         2. 归一化后提取特征（无攻击）
         """
-        pkl_path = '{}/{}_{}_clean.pkl'.format(
+        pkl_path = '{}/{}_{}{}_clean.pkl'.format(
             path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
+            self._pkl_shots_suffix()
         )
         
         if os.path.isfile(pkl_path):
@@ -735,11 +792,12 @@ class SimpleTrainer(TrainerBase):
         """
         生成验证集的对抗嵌入（用于每个 epoch 的验证）
         
-        流程与 before_adv_train 相同，但使用验证集数据
+        支持 'PGD'（特征扰动）和 'PGD_whitebox'（白盒分类攻击）
         """
-        pkl_path = '{}/{}_{}_val_v2.pkl'.format(
+        pkl_path = '{}/{}_{}{}_val_v2.pkl'.format(
             path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_")
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
+            self._pkl_shots_suffix()
         )
         
         if os.path.isfile(pkl_path):
@@ -747,126 +805,238 @@ class SimpleTrainer(TrainerBase):
             print(f'[before_adv_val] Loaded val_pkl from {pkl_path}')
             return
         
-        # 检查是否有验证集
         if self.val_loader_notransform is None:
             print("[before_adv_val] No validation set available, skipping...")
             self.val_pkl = None
             return
         
-        print("[before_adv_val] Generating validation adversarial embeddings...")
-        
         normalizer = ImageNormalizer(device=self.device)
-        val_eps = self.cfg.DATASET.TRAIN_EPS  # 使用与训练相同的扰动强度
+        val_eps = self.cfg.DATASET.TRAIN_EPS
+        num_iters = getattr(self.cfg.DATASET, 'Train_PGD_NUM_ITERS', 60)
         
         model = get_model(self.model)
         image_encoder = model.image_encoder
-        image_encoder.to(self.device) # 确保 image_encoder 在 GPU 上
+        image_encoder.to(self.device)
+        image_encoder.eval()
         dtype = model.dtype
         
-        # 构建代理模型
-        clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
-        if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
-            raise NotImplementedError("fp32/amp not supported for surrogate model")
-        surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
-
-        if attack == 'PGD':
-            num_iters = getattr(self.cfg.DATASET, 'Test_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
-            attacker = create_pgd_attacker(val_eps, normalizer, self.cfg, num_iters=num_iters)
-            print(f"[before_adv_val] Using PGD attack with eps={val_eps}/255, iters={num_iters}")
-        else:
-            raise ValueError(f"Unknown attack type: {attack}")
-
         embedding_dim = image_encoder.output_dim
         data_loader = self.val_loader_notransform
         self.val_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
-        
-        image_encoder.eval()
-        
-        print(f"[before_adv_val] Processing {len(data_loader)} batches...")
-        for batch_idx, batch in enumerate(data_loader):
-            inputs_pixel = batch['img'].to(self.device)
-            images_adv_pixel = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc')
-            
-            eps_val = val_eps / 255.
-            assert torch.max(images_adv_pixel - inputs_pixel) < (eps_val + 1e-6)
-            assert torch.min(images_adv_pixel - inputs_pixel) > (-eps_val - 1e-6)
-            
-            images_adv_normalized = normalizer.normalize(images_adv_pixel)
-            
-            with torch.no_grad():
-                embedding = image_encoder(images_adv_normalized.type(dtype))
 
-            start_idx = batch_idx * data_loader.batch_size
-            end_idx = start_idx + embedding.shape[0]
-            self.val_pkl[start_idx:end_idx] = embedding.cpu().float()
-            
-            if (batch_idx + 1) % 10 == 0:
-                print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
+        if attack == 'PGD':
+            print("[before_adv_val] Mode: feature-distortion PGD (surrogate)")
+            clip_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
+            if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
+                raise NotImplementedError("fp32/amp not supported for surrogate model")
+            surrogate = ClipModel(model=get_model(clip_model.visual), num_classes=2).eval().to(self.device)
+            attacker = create_pgd_attacker(val_eps, normalizer, self.cfg, num_iters=num_iters)
+
+            print(f"[before_adv_val] eps={val_eps}/255, iters={num_iters}, batches={len(data_loader)}")
+            for batch_idx, batch in enumerate(data_loader):
+                inputs_pixel = batch['img'].to(self.device)
+                images_adv_pixel = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc')
+
+                images_adv_normalized = normalizer.normalize(images_adv_pixel)
+                with torch.no_grad():
+                    embedding = image_encoder(images_adv_normalized.type(dtype))
+
+                start_idx = batch_idx * data_loader.batch_size
+                end_idx = start_idx + embedding.shape[0]
+                self.val_pkl[start_idx:end_idx] = embedding.cpu().float()
+
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
+
+            del surrogate
+
+        elif attack == 'PGD_whitebox':
+            print("[before_adv_val] Mode: white-box classification PGD")
+            temp_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device=self.device)
+            temp_model.float().eval()
+
+            classnames = [self.lab2cname[i] for i in range(len(self.lab2cname))]
+            prompts_text = [f"a photo of a {c.replace('_', ' ')}." for c in classnames]
+            tokens = clip.tokenize(prompts_text).to(self.device)
+            with torch.no_grad():
+                text_features = temp_model.encode_text(tokens).float()
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logit_scale = temp_model.logit_scale.exp().detach()
+            attack_encoder = temp_model.visual
+
+            eps_val = val_eps / 255.0
+            alpha = eps_val / num_iters * 2.5
+
+            print(f"[before_adv_val] eps={eps_val:.6f} ({val_eps}/255), iters={num_iters}, "
+                  f"batches={len(data_loader)}")
+
+            for batch_idx, batch in enumerate(data_loader):
+                images = batch['img'].to(self.device).float()
+                labels = batch['label'].to(self.device)
+
+                delta = torch.zeros_like(images).uniform_(-eps_val, eps_val)
+                delta = torch.clamp(images + delta, 0, 1) - images
+
+                for _ in range(num_iters):
+                    delta.requires_grad_(True)
+                    adv_norm = normalizer.normalize(images + delta)
+                    feats = attack_encoder(adv_norm).float()
+                    feats_n = feats / feats.norm(dim=-1, keepdim=True)
+                    logits = logit_scale * feats_n @ text_features.T
+                    loss = F.cross_entropy(logits, labels)
+                    loss.backward()
+                    grad = delta.grad.detach().sign()
+                    delta = (delta.detach() + alpha * grad).clamp(-eps_val, eps_val)
+                    delta = torch.clamp(images + delta, 0, 1) - images
+
+                adv_final = (images + delta.detach()).clamp(0, 1)
+                adv_normalized = normalizer.normalize(adv_final)
+                with torch.no_grad():
+                    embedding = image_encoder(adv_normalized.type(dtype))
+
+                start_idx = batch_idx * data_loader.batch_size
+                end_idx = start_idx + embedding.shape[0]
+                self.val_pkl[start_idx:end_idx] = embedding.cpu().float()
+
+                if (batch_idx + 1) % 5 == 0:
+                    print(f"  [{batch_idx + 1}/{len(data_loader)}] done")
+
+            del temp_model
+
+        else:
+            raise ValueError(f"Unknown attack type: {attack}")
 
         torch.save(self.val_pkl, pkl_path)
-        print(f'[before_adv_val] Generated and saved val_pkl to {pkl_path}')
-        del surrogate
+        print(f'[before_adv_val] Saved to {pkl_path}')
         torch.cuda.empty_cache()
 
     def before_adv_test(self, path, attack='PGD'):
         """
-        对抗测试前的准备：生成测试集的对抗样本。
+        对抗测试前的准备：生成测试集的对抗嵌入。
         
-        流程（无来回归一化）：
+        支持两种攻击模式（通过 attack 参数选择）：
+          - 'PGD':          特征扰动攻击（旧方式，用随机代理模型扰乱特征分布）
+          - 'PGD_whitebox':  白盒分类攻击（标准评测，直接最大化零样本分类交叉熵）
+        
+        流程：
         1. 使用不带归一化的 DataLoader，直接获取 [0,1] 像素空间图像
-        2. PGD 攻击（攻击器内部归一化后传给网络）
-        3. 攻击结果归一化后保存（供 test_adv 使用）
+        2. PGD 攻击生成对抗图像
+        3. 归一化后提取 embedding 保存
         """
-        pkl_path = '{}/{}_{}_{}.pkl'.format(
-            path, self.cfg.DATASET.NAME, 
-            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"), attack
+        # 根据攻击模式选择不同的 pkl 文件名
+        suffix = '_whitebox' if attack == 'PGD_whitebox' else ''
+        pkl_path = '{}/{}_{}_test_v2{}.pkl'.format(
+            path, self.cfg.DATASET.NAME,
+            self.cfg.MODEL.BACKBONE.NAME.replace("/", "_"),
+            suffix
         )
-        
-        # 初始化归一化器（保存为实例属性供 test_adv 使用）
-        self.normalizer = ImageNormalizer(device=self.device)
-        
+
         if os.path.isfile(pkl_path):
-            self.test_pkl = torch.load(pkl_path, weights_only=False)
+            self.test_pkl = torch.load(pkl_path, weights_only=False).to('cpu')
+            print(f'[before_adv_test] Loaded test_pkl ({attack}) from {pkl_path}')
             return
-        
-        # 使用不带归一化的测试 DataLoader
+
         data_loader = self.test_loader_notransform
-        self.test_pkl = torch.empty(size=[len(data_loader.dataset), 3, 224, 224])
+        normalizer = ImageNormalizer(device=self.device)
         test_eps = self.cfg.DATASET.TEST_EPS
+        num_iters = getattr(self.cfg.DATASET, 'Test_PGD_NUM_ITERS', 100)
+
+        model = get_model(self.model)
+        image_encoder = model.image_encoder
+        image_encoder.to(self.device)
+        image_encoder.eval()
+        dtype = model.dtype
+
+        embedding_dim = image_encoder.output_dim
+        self.test_pkl = torch.empty(size=[len(data_loader.dataset), embedding_dim])
 
         if attack == 'PGD':
+            print("[before_adv_test] Mode: feature-distortion PGD (surrogate)")
             temp_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device='cpu')
             if self.cfg.TRAINER.ADV.PREC == "fp32" or self.cfg.TRAINER.ADV.PREC == "amp":
                 temp_model.float()
-                print("[before_adv_test] CLIP model converted to fp32")
-            
+
             surrogate = ClipModel(model=get_model(temp_model.visual), num_classes=2).eval().to(self.device)
-            num_iters = getattr(self.cfg.DATASET, 'Test_PGD_NUM_ITERS', self.cfg.DATASET.PGD_NUM_ITERS)
-            attacker = create_pgd_attacker(test_eps, self.normalizer, self.cfg, num_iters=num_iters)
-            
+            attacker = create_pgd_attacker(test_eps, normalizer, self.cfg, num_iters=num_iters)
+
+            print(f"[before_adv_test] eps={test_eps}/255, iters={num_iters}, batches={len(data_loader)}")
             for batch_idx, batch in enumerate(data_loader):
-                # 直接是 [0,1] 像素空间图像，无需反归一化
                 inputs_pixel = batch['img'].to(self.device)
-                
-                # PGD 攻击（攻击器内部会归一化后传给网络）
                 images_adv_pixel = attacker.run(surrogate, inputs_pixel, scaler=1, feature_layer='fc')
-                
-                # 验证扰动限制
-                eps_val = test_eps / 255.
-                assert torch.max(images_adv_pixel - inputs_pixel) < (eps_val + 1e-6)
-                assert torch.min(images_adv_pixel - inputs_pixel) > (-eps_val - 1e-6)
-                
-                # 归一化后保存（供 test_adv 使用）
-                images_adv_normalized = self.normalizer.normalize(images_adv_pixel)
+
+                images_adv_normalized = normalizer.normalize(images_adv_pixel)
+                with torch.no_grad():
+                    embedding = image_encoder(images_adv_normalized.type(dtype))
+
                 start_idx = batch_idx * data_loader.batch_size
-                end_idx = start_idx + images_adv_normalized.shape[0]
-                self.test_pkl[start_idx:end_idx] = images_adv_normalized.cpu()
-            
+                end_idx = start_idx + embedding.shape[0]
+                self.test_pkl[start_idx:end_idx] = embedding.cpu().float()
+
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"  Processed {batch_idx + 1}/{len(data_loader)} batches")
+
             torch.save(self.test_pkl, pkl_path)
+            print(f'[before_adv_test] Saved to {pkl_path}')
             del surrogate
+
+        elif attack == 'PGD_whitebox':
+            print("[before_adv_test] Mode: white-box classification PGD")
+            temp_model, _ = clip.load(self.cfg.MODEL.BACKBONE.NAME, device=self.device)
+            temp_model.float().eval()
+
+            classnames = [self.lab2cname[i] for i in range(len(self.lab2cname))]
+            prompts_text = [f"a photo of a {c.replace('_', ' ')}." for c in classnames]
+            tokens = clip.tokenize(prompts_text).to(self.device)
+            with torch.no_grad():
+                text_features = temp_model.encode_text(tokens).float()
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logit_scale = temp_model.logit_scale.exp().detach()
+            attack_encoder = temp_model.visual
+
+            eps_val = test_eps / 255.0
+            alpha = eps_val / num_iters * 2.5
+
+            print(f"[before_adv_test] eps={eps_val:.6f} ({test_eps}/255), "
+                  f"iters={num_iters}, alpha={alpha:.6f}, batches={len(data_loader)}")
+
+            for batch_idx, batch in enumerate(data_loader):
+                images = batch['img'].to(self.device).float()
+                labels = batch['label'].to(self.device)
+
+                delta = torch.zeros_like(images).uniform_(-eps_val, eps_val)
+                delta = torch.clamp(images + delta, 0, 1) - images
+
+                for _ in range(num_iters):
+                    delta.requires_grad_(True)
+                    adv_norm = normalizer.normalize(images + delta)
+                    feats = attack_encoder(adv_norm).float()
+                    feats_n = feats / feats.norm(dim=-1, keepdim=True)
+                    logits = logit_scale * feats_n @ text_features.T
+                    loss = F.cross_entropy(logits, labels)
+                    loss.backward()
+                    grad = delta.grad.detach().sign()
+                    delta = (delta.detach() + alpha * grad).clamp(-eps_val, eps_val)
+                    delta = torch.clamp(images + delta, 0, 1) - images
+
+                adv_final = (images + delta.detach()).clamp(0, 1)
+                adv_normalized = normalizer.normalize(adv_final)
+                with torch.no_grad():
+                    embedding = image_encoder(adv_normalized.type(dtype))
+
+                start_idx = batch_idx * data_loader.batch_size
+                end_idx = start_idx + embedding.shape[0]
+                self.test_pkl[start_idx:end_idx] = embedding.cpu().float()
+
+                if (batch_idx + 1) % 5 == 0:
+                    print(f"  [{batch_idx + 1}/{len(data_loader)}] done")
+
+            torch.save(self.test_pkl, pkl_path)
+            print(f'[before_adv_test] Saved to {pkl_path}')
+            del temp_model
+
         else:
             raise ValueError(f"Unknown attack type: {attack}")
-        
+
         torch.cuda.empty_cache()
 
     def before_black_test(self, path, attack='RAP'):
@@ -1408,6 +1578,86 @@ class TrainerX(SimpleTrainer):
         self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
         self.write_scalar("epoch_train/mix_clean_ratio", float(mix_clean_ratio), self.epoch + 1)
         self.write_scalar("epoch_train/use_data_mixing", 1.0 if use_data_mixing else 0.0, self.epoch + 1)
+
+        # 保存 epoch 级训练准确率，供 after_epoch 使用（避免重新评估）
+        if "acc" in losses.meters:
+            self._epoch_train_acc = losses.meters["acc"].avg
+
+    def run_epoch_realtime_adv(self):
+        """
+        运行实时对抗训练的一个 epoch
+        
+        与 run_epoch_adv 的区别：
+        - run_epoch_adv: 使用预计算的 embedding bank
+        - run_epoch_realtime_adv: 每个 batch 实时进行 PGD 攻击
+        
+        这种方式更慢，但攻击目标包括正在训练的 ODE 网络，
+        因此能生成更强的对抗样本。
+        """
+        self.set_model_mode("train")
+        losses = MetricMeter()
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        
+        # 使用不带归一化的 DataLoader，因为 PGD 攻击需要 [0,1] 像素空间图像
+        data_loader = self.train_loader_x_notransform_noshuffle
+        self.num_batches = len(data_loader)
+
+        end = time.time()
+        for self.batch_idx, batch in enumerate(data_loader):
+            data_time.update(time.time() - end)
+            
+            # 调用实时对抗训练方法
+            loss_summary = self.forward_backward_realtime_adv(batch)
+            
+            batch_time.update(time.time() - end)
+            losses.update(loss_summary)
+
+            # 日志记录
+            meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
+            only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
+            if meet_freq or only_few_batches:
+                nb_remain = 0
+                nb_remain += self.num_batches - self.batch_idx - 1
+                nb_remain += (
+                                     self.max_epoch - self.epoch - 1
+                             ) * self.num_batches
+                eta_seconds = batch_time.avg * nb_remain
+                eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+
+                info = []
+                info += [f"epoch [{self.epoch + 1}/{self.max_epoch}]"]
+                info += [f"batch [{self.batch_idx + 1}/{self.num_batches}]"]
+                info += [f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"]
+                info += [f"data {data_time.val:.3f} ({data_time.avg:.3f})"]
+                info += [f"{losses}"]
+                info += [f"lr {self.get_current_lr():.4e}"]
+                info += [f"eta {eta}"]
+                print(" ".join(info))
+
+            n_iter = self.epoch * self.num_batches + self.batch_idx
+            for name, meter in losses.meters.items():
+                self.write_scalar("train/" + name, meter.avg, n_iter)
+            self.write_scalar("train/lr", self.get_current_lr(), n_iter)
+
+            end = time.time()
+
+        # epoch 级聚合指标
+        for name, meter in losses.meters.items():
+            self.write_scalar("epoch_train/" + name, meter.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/lr", self.get_current_lr(), self.epoch + 1)
+        self.write_scalar("epoch_train/batch_time_avg", batch_time.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
+
+        # 保存 epoch 级训练准确率
+        if "acc" in losses.meters:
+            self._epoch_train_acc = losses.meters["acc"].avg
+
+    def forward_backward_realtime_adv(self, batch):
+        """
+        实时对抗训练的默认实现（应由子类重写）
+        """
+        raise NotImplementedError("Subclass must implement forward_backward_realtime_adv")
 
     def parse_batch_train(self, batch):
         input = batch["img"]

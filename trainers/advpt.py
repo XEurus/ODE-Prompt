@@ -49,7 +49,7 @@ _tokenizer = _Tokenizer()
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, '/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/clip')
+    model_path = clip._download(url, './clip')
 
     try:
         # loading JIT archive
@@ -111,14 +111,17 @@ class ODEFunc(nn.Module):
     网络设计:
         f_θ(p, z_v) = MLP_θ([p; z_v])  # 论文公式
         
-    为了处理 batch 维度的不匹配，我们采用以下策略:
-        - 在训练时，z_v 的 batch 均值作为全局视觉条件
-        - 这样 ODE 为所有类别生成统一的提示演化
+    支持的网络类型:
+        - mlp: 普通 MLP
+        - mlp_spectral: MLP + 谱归一化
+        - resnet: ResNet 块
+        - resnet_spectral: ResNet 块 + 谱归一化
     """
-    def __init__(self, prompt_dim, visual_dim):
+    def __init__(self, prompt_dim, visual_dim, network_type="mlp_spectral"):
         super(ODEFunc, self).__init__()
         self.prompt_dim = prompt_dim
         self.visual_dim = visual_dim
+        self.network_type = network_type
         
         # 视觉特征会被存储在这里，供 forward 使用
         # 这是因为 odeint 只允许 forward(t, x) 签名
@@ -129,39 +132,80 @@ class ODEFunc(nn.Module):
         #self.hidden_dim = 768
         self.hidden_dim = prompt_dim * 2
         
-        self.input_proj = spectral_norm(nn.Linear(prompt_dim + visual_dim, self.hidden_dim))
-        # self.norm_in = nn.LayerNorm(self.hidden_dim)
-        self.act = nn.GELU()
-
-        self.mlp = nn.Sequential(
-            spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),nn.GELU(),
-            spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),nn.GELU(),
-        ) # 使用谱归一化
+        # 根据网络类型构建网络
+        self._build_network(network_type)
         
+        print(f"[ODEFunc] Network type: {network_type}")
+        print(f"[ODEFunc] Input dim: {prompt_dim + visual_dim}, Hidden dim: {self.hidden_dim}, Output dim: {prompt_dim}")
+    
+    def _build_network(self, network_type):
+        """根据网络类型构建网络结构"""
+        use_spectral = "spectral" in network_type
+        use_resnet = "resnet" in network_type
+        
+        # 输入投影层
+        if use_spectral:
+            self.input_proj = spectral_norm(nn.Linear(self.prompt_dim + self.visual_dim, self.hidden_dim))
+        else:
+            self.input_proj = nn.Linear(self.prompt_dim + self.visual_dim, self.hidden_dim)
+        
+        self.act = nn.GELU()
+        
+        if use_resnet:
+            # ResNet 网络结构
+            self._build_resnet(use_spectral)
+        else:
+            # MLP 网络结构
+            self._build_mlp(use_spectral)
+        
+        # 输出投影层
+        if use_spectral:
+            self.output_proj = spectral_norm(nn.Linear(self.hidden_dim, self.prompt_dim))
+        else:
+            self.output_proj = nn.Linear(self.hidden_dim, self.prompt_dim)
+    
+    def _build_mlp(self, use_spectral):
+        """构建 MLP 网络"""
+        if use_spectral:
+            self.mlp = nn.Sequential(
+                spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)), nn.GELU(),
+                spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)), nn.GELU(),
+            )
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim), nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim), nn.GELU(),
+            )
+        # 残差块不用于 MLP 模式
+        self.res_blocks = nn.ModuleList()
+    
+    def _build_resnet(self, use_spectral):
+        """构建 ResNet 网络"""
+        # 不使用简单 MLP
+        self.mlp = nn.Identity()
+        
+        # 构建残差块
         self.res_blocks = nn.ModuleList()
         for _ in range(2):  # 2 个残差块
-            block = nn.Sequential(
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-                nn.Linear(self.hidden_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU()
-            )
-            # 关键修复：零初始化残差块的最后一层，确保初始时残差接近零
-            #nn.init.zeros_(block[3].weight)
-            #nn.init.zeros_(block[3].bias)
+            if use_spectral:
+                block = nn.Sequential(
+                    spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU(),
+                    spectral_norm(nn.Linear(self.hidden_dim, self.hidden_dim)),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU()
+                )
+            else:
+                block = nn.Sequential(
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.GELU()
+                )
             self.res_blocks.append(block)
-        
-        # 输出投影（应用谱归一化约束 Lipschitz 常数）
-        self.output_proj = spectral_norm(nn.Linear(self.hidden_dim, prompt_dim))
-        
-        # 关键修复：使用极小的高斯初始化而不是全零
-        # 全零会导致 res_blocks 在初期梯度为0（梯度阻断）
-        # 极小值 (1e-5) 既能保证 ODE 初始接近恒等，又能打通梯度
-        # nn.init.zeros_(self.output_proj.weight)
-        # # nn.init.normal_(self.output_proj.weight, std=1e-5)
-        # nn.init.zeros_(self.output_proj.bias)
     
     def set_visual_feature(self, z_v):
         """
@@ -173,43 +217,6 @@ class ODEFunc(nn.Module):
         # 移除 batch 均值，保留每个样本的独立特征
         self.z_v = z_v  # (batch_size, visual_dim)
 
-    # def forward(self, t, p):
-    #     """
-    #     计算 ODE 导数 dp/dt = f_θ(p, z_v)
-        
-    #     参数:
-    #         t: 当前时间点 (标量，ODE 求解器需要，但我们的动力学是时间无关的)
-    #         p: 当前提示状态，形状 (batch_size, n_ctx, prompt_dim)
-        
-    #     返回:
-    #         dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
-    #     """
-    #     if self.z_v is None:
-    #         raise RuntimeError("必须先调用 set_visual_feature() 设置视觉特征！")
-        
-    #     # p 的形状: (batch_size, n_ctx, prompt_dim)
-    #     # z_v 的形状: (batch_size, visual_dim)
-        
-    #     # 将 z_v 扩展到与 p 的 n_ctx 维度匹配
-    #     # 扩展后形状: (batch_size, n_ctx, visual_dim)
-    #     z_v_expanded = self.z_v.unsqueeze(1).expand(-1, p.shape[1], -1)
-        
-    #     # 拼接: [p(t); z_v]
-    #     # 形状: (batch_size, n_ctx, prompt_dim + visual_dim)
-    #     inp = torch.cat([p, z_v_expanded], dim=-1)
-        
-    #     # Residual MLP 前向传播
-    #     x = self.input_proj(inp)
-    #     x = self.act(x) 
-    #     x = self.mlp(x)
-    #     # for block in self.res_blocks:
-    #     #     x = x + block(x)
-        
-    #     # 输出层
-    #     dp_dt = self.output_proj(x)
-        
-    #     return dp_dt
-
     def forward_ode_network(self, inp):
         """
         核心 ODE 网络计算，不含 z_v 处理逻辑
@@ -220,12 +227,16 @@ class ODEFunc(nn.Module):
         返回:
             dp/dt: 提示状态的变化率，形状 (batch_size, n_ctx, prompt_dim)
         """
-        # Residual MLP 前向传播
+        # 输入投影 + 激活
         x = self.input_proj(inp)
         x = self.act(x)
+        
+        # MLP 或 Identity
         x = self.mlp(x)
-        # for block in self.res_blocks:
-        #     x = x + block(x)
+        
+        # ResNet 残差块 (如果有)
+        for block in self.res_blocks:
+            x = x + block(x)
         
         # 输出层
         dp_dt = self.output_proj(x)
@@ -303,10 +314,13 @@ class PromptLearner(nn.Module):
         # 关键修复：ODE 网络必须使用 float32 以保证数值稳定性
         # torchdiffeq 在 fp16 下会出现严重的数值问题
         # =========================================================
-        self.ode_func = ODEFunc(ctx_dim, visual_dim).float()  # 强制 float32
+        network_type = cfg.TRAINER.ADV.ODE_NETWORK_TYPE
+        self.ode_func = ODEFunc(ctx_dim, visual_dim, network_type).float()  # 强制 float32
         
-        # ODE 求解器参数
-        self.ode_t = torch.tensor([0.0, 1.0])  # 时间范围 [0, T]，T=1
+        # ODE 求解器参数 - 从配置读取 T 值
+        ode_t_end = cfg.TRAINER.ADV.ODE_T
+        self.ode_t = torch.tensor([0.0, ode_t_end])  # 时间范围 [0, T]
+        print(f"[ODE-Prompt] ODE time range: [0, {ode_t_end}]")
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -384,16 +398,23 @@ class PromptLearner(nn.Module):
             # 通过 ODE 网络计算 dp/dt
             return self.ode_func.forward_ode_network(inp)
         
-        p_trajectory = odeint_adjoint(
-            ode_func_closure,   # 使用闭包函数，捕获了正确的 z_v
-            p0_float,           # 初始状态 p(0)，float32
-            t,                  # 时间点 [0, 1]
-            method='dopri5',    # Dormand-Prince 5 (自适应步长)
-            rtol=1e-3,          # 放宽容差以提高数值稳定性
-            atol=1e-4,          
-            options={'min_step': 1e-5},  # 适当的最小步长
-            adjoint_params=tuple(self.ode_func.parameters()) # 关键修复：因为闭包不是 nn.Module，必须显式指定需要求导的参数
+        ode_solver_kwargs = dict(
+            method='dopri5',
+            rtol=1e-3,
+            atol=1e-4,
+            options={'min_step': 1e-5},
         )
+
+        if getattr(self, 'use_standard_odeint', False):
+            p_trajectory = odeint(
+                ode_func_closure, p0_float, t, **ode_solver_kwargs
+            )
+        else:
+            p_trajectory = odeint_adjoint(
+                ode_func_closure, p0_float, t,
+                **ode_solver_kwargs,
+                adjoint_params=tuple(self.ode_func.parameters())
+            )
         
         # 取终端状态 p(T)
         # 形状: (batch_size, n_ctx, prompt_dim)
@@ -715,15 +736,18 @@ class AdvPT(TrainerX):
         label = batch["label"].to(self.device)
         use_loss_mix = 1
 
+        # 处理 DataParallel 包装的情况
+        model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
         # 计算对抗损失的嵌入
-        output_adv = self.model.forward_embedding(embedding_adv)
+        output_adv = model.forward_embedding(embedding_adv)
         loss_adv = torch.nn.CrossEntropyLoss()(output_adv, label)
 
         if use_loss_mix:
             # 计算与干净图像的损失（如果clean_pkl可用）
             #if 'images_clean' in batch_dict and batch_dict['images_clean'] is not None:
             embedding_clean = batch_dict['images_clean'].to(self.device)
-            output_clean = self.model.forward_embedding(embedding_clean)
+            output_clean = model.forward_embedding(embedding_clean)
             loss_clean = torch.nn.CrossEntropyLoss()(output_clean, label)
             # 1:1 比例混合
             loss = 0.4 * loss_adv + 0.6 * loss_clean
@@ -800,78 +824,89 @@ class AdvPT(TrainerX):
 
     def after_epoch(self):
         """
-        每个 epoch 结束后进行验证（仅使用对抗数据）
+        每个 epoch 结束后进行验证
         
         显示：
         1. 训练集对抗准确率
         2. 验证集对抗准确率
+        
+        实时模式：
+        - 验证集使用实时 PGD100 eps=1/255 攻击
+        - 跳过测试集评估（太慢）
         """
         last_epoch = (self.epoch + 1) == self.max_epoch
         do_test = not self.cfg.TEST.NO_TEST
+        is_realtime = getattr(self, 'realtime_adv', False) or getattr(self.cfg, 'realtime_adv', False)
         
         if not do_test:
             return
         
         print(f"\n{'='*60}")
         print(f"Epoch {self.epoch + 1}/{self.max_epoch} - Adversarial Validation")
+        if is_realtime:
+            print(f"[Realtime Mode] Val: PGD100 eps=1/255 | Test: SKIPPED")
         print(f"{'='*60}")
         
         # 获取每个 epoch 测试的 batch 数量
         max_batches = getattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES', 2)
-        partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
         
-        # 1. 训练集对抗准确率
-        train_acc = None
-        if hasattr(self, 'train_pkl') and self.train_pkl is not None:
-            print(f'\n[1/2] Train Adversarial Accuracy:')
-            train_acc = self._eval_adv_embedding(
-                self.train_pkl,
-                self.train_loader_x_noshuffle,
-                max_batches=max_batches
-            )
+        # 1. 训练集对抗准确率 - 直接使用 run_epoch_adv 中统计的平均值
+        train_acc = getattr(self, '_epoch_train_acc', None)
+        if train_acc is not None:
+            print(f'\n[1/2] Train Adversarial Accuracy (from training):')
             print(f"      Train Adv Acc: {train_acc:.2f}%")
         else:
-            print(f'\n[1/2] Train adversarial test skipped (train_pkl not prepared)')
+            print(f'\n[1/2] Train adversarial accuracy not available')
         
         # 2. 验证集对抗准确率
         val_acc = None
         val_loss = None
-        if hasattr(self, 'val_pkl') and self.val_pkl is not None:
-            print(f'\n[2/2] Validation Adversarial Accuracy:')
-            val_acc = self._eval_adv_embedding(
-                self.val_pkl,
-                self.val_loader,
-                max_batches=max_batches
-            )
-            print(f"      Val Adv Acc: {val_acc:.2f}%")
-            # if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-            val_loss = self._eval_adv_embedding_loss(
-                self.val_pkl,
-                self.val_loader,
-                max_batches=max_batches
-            )
-        elif hasattr(self, 'test_pkl') and self.test_pkl is not None:
-            # 如果没有验证集对抗嵌入，使用测试集
-            print(f'\n[2/2] Test Adversarial Accuracy (no val_pkl):')
-            val_acc = self.test_adv_partial(split="test", max_batches=max_batches)
-            print(f"      Test Adv Acc: {val_acc:.2f}%")
-            #if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-            val_loss = self._eval_adv_embedding_loss(
-                self.test_pkl,
-                self.test_loader,
-                max_batches=max_batches
-            )
+        
+        if is_realtime:
+            # 实时模式：对验证集进行实时 PGD 攻击
+            print(f'\n[2/2] Validation Adversarial Accuracy (Realtime PGD100 eps=1/255):')
+            val_acc, val_loss = self._eval_realtime_adv_val(max_batches=max_batches)
+            if val_acc is not None:
+                print(f"      Val Adv Acc: {val_acc:.2f}%")
+            else:
+                print(f"      Val Adv Acc: N/A (no val_loader)")
         else:
-            print(f'\n[2/2] Validation adversarial test skipped')
+            # Bank 模式：使用预计算的 embedding
+            if hasattr(self, 'val_pkl') and self.val_pkl is not None:
+                print(f'\n[2/2] Validation Adversarial Accuracy:')
+                val_acc = self._eval_adv_embedding(
+                    self.val_pkl,
+                    self.val_loader,
+                    max_batches=max_batches
+                )
+                print(f"      Val Adv Acc: {val_acc:.2f}%")
+                val_loss = self._eval_adv_embedding_loss(
+                    self.val_pkl,
+                    self.val_loader,
+                    max_batches=max_batches
+                )
+            elif hasattr(self, 'test_pkl') and self.test_pkl is not None:
+                print(f'\n[2/2] Test Adversarial Accuracy (no val_pkl):')
+                val_acc = self.test_adv_partial(split="test", max_batches=max_batches)
+                print(f"      Test Adv Acc: {val_acc:.2f}%")
+                val_loss = self._eval_adv_embedding_loss(
+                    self.test_pkl,
+                    self.test_loader,
+                    max_batches=max_batches
+                )
+            else:
+                print(f'\n[2/2] Validation adversarial test skipped')
 
-        # 3. 每个 epoch 额外评估部分 test（用于观察 val/test 偏差）
+        # 3. 测试集评估（实时模式跳过）
         test_partial_acc = None
-        if hasattr(self, 'test_pkl') and self.test_pkl is not None:
-            print(f'\n[Extra] Partial Test Adversarial Accuracy ({partial_test_batches} batches):')
-            test_partial_acc = self.test_adv_partial(split="test", max_batches=partial_test_batches)
-            print(f"      Test Partial Adv Acc: {test_partial_acc:.2f}%")
-        else:
-            print(f'\n[Extra] Partial test adversarial evaluation skipped (test_pkl not prepared)')
+        if not is_realtime:
+            partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
+            if hasattr(self, 'test_pkl') and self.test_pkl is not None:
+                print(f'\n[Extra] Partial Test Adversarial Accuracy ({partial_test_batches} batches):')
+                test_partial_acc = self.test_adv_partial(split="test", max_batches=partial_test_batches)
+                print(f"      Test Partial Adv Acc: {test_partial_acc:.2f}%")
+            else:
+                print(f'\n[Extra] Partial test adversarial evaluation skipped')
         
         # 打印摘要
         summary_parts = []
@@ -880,7 +915,7 @@ class AdvPT(TrainerX):
         if val_acc is not None:
             summary_parts.append(f"Val: {val_acc:.2f}%")
         if test_partial_acc is not None:
-            summary_parts.append(f"Test@{partial_test_batches}b: {test_partial_acc:.2f}%")
+            summary_parts.append(f"Test: {test_partial_acc:.2f}%")
         if summary_parts:
             print(f"\n[Summary] {' | '.join(summary_parts)}")
         
@@ -893,12 +928,8 @@ class AdvPT(TrainerX):
             self.write_scalar("epoch/val_adv_loss", val_loss, self.epoch)
         if test_partial_acc is not None:
             self.write_scalar("epoch/test_partial_adv_acc", test_partial_acc, self.epoch)
-        if val_acc is not None and test_partial_acc is not None:
-            gap = val_acc - test_partial_acc
-            #self.write_scalar("epoch/val_test_gap", gap, self.epoch)
-            self.write_scalar("epoch/val_test_gap_abs", abs(gap), self.epoch)
 
-        # 统一打印一行结构化指标，便于日志解析/画图
+        # 统一打印一行结构化指标
         print(
             f"[EpochMetrics] epoch={self.epoch + 1} "
             f"train_adv_acc={train_acc if train_acc is not None else 'NA'} "
@@ -906,11 +937,11 @@ class AdvPT(TrainerX):
             f"test_partial_adv_acc={test_partial_acc if test_partial_acc is not None else 'NA'}"
         )
 
-        # 使用验证集损失驱动学习率调整（ReduceLROnPlateau）
+        # 使用验证集损失驱动学习率调整
         if self.cfg.OPTIM.LR_SCHEDULER == "plateau" and val_loss is not None:
             self.sched.step(val_loss)
         
-        # 保存最佳模型（基于验证集对抗准确率）
+        # 保存最佳模型
         if val_acc is not None:
             is_best = val_acc > self.best_result
             if is_best:
@@ -937,6 +968,121 @@ class AdvPT(TrainerX):
             print(f"[Checkpoint Saved] Epoch {self.epoch + 1}")
         
         print(f"{'='*60}\n")
+    
+    def _eval_realtime_adv_val(self, max_batches=None):
+        """
+        实时对验证集进行 PGD 攻击并评估
+        
+        攻击参数（与最终测试一致）：
+        - PGD100 迭代
+        - eps = 1/255
+        
+        返回:
+            val_acc: 验证集对抗准确率
+            val_loss: 验证集对抗损失
+        """
+        if self.val_loader is None:
+            return None, None
+        
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+        
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        dtype = model.dtype
+        
+        # 确保 normalizer 已初始化
+        if not hasattr(self, 'normalizer'):
+            from utils.adv_utils import ImageNormalizer
+            self.normalizer = ImageNormalizer(device=self.device)
+        
+        # 使用不带归一化的验证集 DataLoader
+        val_loader = getattr(self, 'val_loader_notransform', None)
+        if val_loader is None:
+            val_loader = self.val_loader
+            print("      [WARN] val_loader_notransform not found, using val_loader")
+        
+        # 攻击参数：与最终测试一致
+        num_iters = 100  # PGD100
+        eps = 1  # 1/255
+        eps_val = eps / 255.0
+        alpha = eps_val / 4  # 步长 = eps / 4
+        
+        # 确保 image_encoder 在 GPU 上
+        model.image_encoder.to(self.device)
+        model.image_encoder.eval()
+        model.text_encoder.eval()
+        model.prompt_learner.eval()
+        
+        # 临时切换到标准 odeint
+        original_use_standard = getattr(model.prompt_learner, 'use_standard_odeint', False)
+        model.prompt_learner.use_standard_odeint = True
+        
+        total_loss = 0.0
+        total_count = 0
+        
+        for batch_idx, batch in enumerate(val_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+            
+            images = batch["img"].to(self.device)
+            labels = batch["label"].to(self.device)
+            
+            # PGD 攻击
+            delta = torch.zeros_like(images).uniform_(-eps_val, eps_val)
+            delta = torch.clamp(images + delta, 0, 1) - images
+            
+            for _ in range(num_iters):
+                delta.requires_grad_(True)
+                adv_images = images + delta
+                adv_normalized = self.normalizer.normalize(adv_images)
+                
+                with torch.enable_grad():
+                    image_features = model.image_encoder(adv_normalized.type(dtype))
+                    prompts = model.prompt_learner(image_features)
+                    
+                    bs, n_cls, n_ctx, dim = prompts.shape
+                    prompts_flat = prompts.reshape(bs * n_cls, n_ctx, dim)
+                    tokenized_prompts = model.tokenized_prompts
+                    tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
+                    
+                    text_features = model.text_encoder(prompts_flat, tokenized_prompts_flat)
+                    text_features = text_features.view(bs, n_cls, -1)
+                    
+                    image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
+                    text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
+                    
+                    logit_scale = model.logit_scale.exp()
+                    logits = logit_scale * torch.einsum("bd,bnd->bn", image_features_norm, text_features_norm)
+                    
+                    loss = F.cross_entropy(logits, labels)
+                
+                loss.backward()
+                grad = delta.grad.detach().sign()
+                delta = (delta.detach() + alpha * grad).clamp(-eps_val, eps_val)
+                delta = torch.clamp(images + delta, 0, 1) - images
+            
+            # 最终评估
+            adv_images_final = (images + delta.detach()).clamp(0, 1)
+            adv_normalized_final = self.normalizer.normalize(adv_images_final)
+            
+            with torch.no_grad():
+                adv_embedding = model.image_encoder(adv_normalized_final.type(dtype))
+                output = model.forward_embedding(adv_embedding)
+                
+                loss_val = F.cross_entropy(output, labels, reduction="sum")
+                total_loss += loss_val.item()
+                total_count += labels.shape[0]
+            
+            self.evaluator.process(output, labels)
+        
+        # 恢复模型状态
+        model.prompt_learner.use_standard_odeint = original_use_standard
+        
+        results = self.evaluator.evaluate()
+        val_acc = list(results.values())[0]
+        val_loss = total_loss / total_count if total_count > 0 else None
+        
+        return val_acc, val_loss
 
     @torch.no_grad()
     def _eval_adv_embedding(self, embedding_pkl, data_loader, max_batches=None):
@@ -1021,13 +1167,21 @@ class AdvPT(TrainerX):
         参数:
             split: 数据集划分 ('test' or 'val')
             max_batches: 最多测试的 batch 数量（None 表示测试全部）
-            use_adv: 是否使用对抗样本
+            use_adv: 是否使用对抗样本（使用预计算的对抗 embedding 或图像）
         
         返回:
             准确率 (%)
+        
+        注意:
+            自动检测 test_pkl 的格式：
+            - [N, dim] (embedding) → forward_embedding（与训练一致）
+            - [N, 3, H, W] (图像) → model_inference（黑盒攻击兼容）
         """
         self.set_model_mode("eval")
         self.evaluator.reset()
+        
+        # 获取实际模型（处理 DataParallel 包装）
+        model = self.model.module if hasattr(self.model, 'module') else self.model
 
         if split is None:
             split = self.cfg.TEST.SPLIT
@@ -1038,38 +1192,42 @@ class AdvPT(TrainerX):
             split = "test"
             data_loader = self.test_loader
 
-        # 初始化归一化器（仅对抗测试时需要）
-        if use_adv:
-            if not hasattr(self, 'normalizer'):
-                self.normalizer = ImageNormalizer(device=self.device)
-            else:
-                self.normalizer.to(self.device)
-            test_eps = self.cfg.DATASET.TEST_EPS / 255.0
-            array_to_pkl = self.test_pkl
+        # 检测 test_pkl 的格式
+        is_embedding_format = False
+        if use_adv and hasattr(self, 'test_pkl') and self.test_pkl is not None:
+            # embedding: [N, dim], 图像: [N, 3, H, W]
+            is_embedding_format = (self.test_pkl.dim() == 2)
 
         # 打印测试信息
         batch_info = f"first {max_batches} batches" if max_batches else "all"
-        adv_info = "adversarial" if use_adv else "clean"
+        if use_adv:
+            adv_info = "adversarial (embedding)" if is_embedding_format else "adversarial (image)"
+        else:
+            adv_info = "clean"
         print(f"Evaluate {adv_info} on the *{split}* set ({batch_info})")
 
         for batch_idx, batch in enumerate(data_loader):
             if max_batches and batch_idx >= max_batches:
                 break
             
-            input, label = self.parse_batch_test(batch)
+            label = batch["label"].to(self.device)
             
             if use_adv:
-                # 获取对应的对抗样本
                 start_idx = batch_idx * data_loader.batch_size
-                end_idx = start_idx + input.shape[0]
-                input_adv = array_to_pkl[start_idx:end_idx].to(input.device)
+                end_idx = start_idx + label.shape[0]
+                adv_data = self.test_pkl[start_idx:end_idx].to(self.device)
                 
-                # 使用 normalizer 限制扰动
-                input_to_eval = self.normalizer.clamp_perturbation(input_adv, input, test_eps)
+                if is_embedding_format:
+                    # embedding 格式：直接用 forward_embedding
+                    output = model.forward_embedding(adv_data)
+                else:
+                    # 图像格式：用 model_inference（黑盒攻击兼容）
+                    output = self.model_inference(adv_data)
             else:
-                input_to_eval = input
+                # 干净测试：使用图像 + model_inference
+                input = batch["img"].to(self.device)
+                output = self.model_inference(input)
             
-            output = self.model_inference(input_to_eval)
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()
@@ -1079,6 +1237,11 @@ class AdvPT(TrainerX):
     def test_partial(self, split=None, max_batches=20):
         """部分数据集测试（干净样本）"""
         return self._test_impl(split, max_batches=max_batches, use_adv=False)
+
+    @torch.no_grad()
+    def test_adv(self, split=None):
+        """完整数据集对抗测试（使用预加载 pkl，自动识别 embedding/image 格式）"""
+        return self._test_impl(split, max_batches=None, use_adv=True)
 
     @torch.no_grad()
     def test_adv_partial(self, split=None, max_batches=20):
@@ -1266,3 +1429,212 @@ class AdvPT(TrainerX):
             print("[Verify] ODE network layer statistics:")
             for layer_name, param in ode_func.named_parameters():
                 print(f"  - {layer_name}: shape={list(param.shape)}, mean={param.mean().item():.6f}, std={param.std().item():.6f}")
+
+    # =========================================================================
+    # 实时对抗训练相关方法
+    # =========================================================================
+    
+    def pgd_attack_realtime(self, images, labels, num_iters=None, eps=None):
+        """
+        实时 PGD 攻击：对完整模型（包括 ODE 网络）进行白盒攻击
+        
+        注意：每个 batch 只进行一次 PGD 攻击，不像 bank 模式那样多次 restart
+        
+        参数:
+            images: 原始图像，形状 (batch_size, 3, H, W)，像素范围 [0, 1]
+            labels: 标签，形状 (batch_size,)
+            num_iters: PGD 迭代次数
+            eps: 扰动强度（像素值 /255）
+        
+        返回:
+            adv_images: 对抗图像，形状 (batch_size, 3, H, W)，已归一化
+            adv_embedding: 对抗图像的嵌入，形状 (batch_size, dim)
+        """
+        if num_iters is None:
+            num_iters = getattr(self.cfg.TRAINER.ADV, 'REALTIME_PGD_ITERS', 10)
+        if eps is None:
+            eps = self.cfg.DATASET.TRAIN_EPS
+        
+        eps_val = eps / 255.0
+        alpha = eps_val / num_iters * 2.5  # 步长
+        
+        # 获取模型
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        dtype = model.dtype
+        
+        # 确保 normalizer 已初始化
+        if not hasattr(self, 'normalizer'):
+            from utils.adv_utils import ImageNormalizer
+            self.normalizer = ImageNormalizer(device=self.device)
+        
+        # 确保 image_encoder 在 GPU 上
+        model.image_encoder.to(self.device)
+        model.image_encoder.eval()
+        model.text_encoder.eval()
+        
+        # 保存 ODE 网络原始状态
+        was_training = model.prompt_learner.training
+        # 攻击时使用 eval 模式，确保 ODE 行为一致
+        model.prompt_learner.eval()
+        
+        # 临时切换到标准 odeint（攻击时不需要 adjoint 反向传播）
+        original_use_standard = getattr(model.prompt_learner, 'use_standard_odeint', False)
+        model.prompt_learner.use_standard_odeint = True
+        
+        # 初始化扰动
+        delta = torch.zeros_like(images).uniform_(-eps_val, eps_val)
+        delta = torch.clamp(images + delta, 0, 1) - images
+        
+        # PGD 攻击循环
+        for _ in range(num_iters):
+            delta.requires_grad_(True)
+            
+            # 生成对抗图像并归一化
+            adv_images = images + delta
+            adv_normalized = self.normalizer.normalize(adv_images)
+            
+            # 前向传播：通过完整模型
+            with torch.enable_grad():
+                # 获取对抗图像的嵌入
+                image_features = model.image_encoder(adv_normalized.type(dtype))
+                
+                # 通过 ODE 演化提示并计算 logits
+                prompts = model.prompt_learner(image_features)
+                
+                # 编码提示
+                bs, n_cls, n_ctx, dim = prompts.shape
+                prompts_flat = prompts.reshape(bs * n_cls, n_ctx, dim)
+                tokenized_prompts = model.tokenized_prompts
+                tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
+                
+                text_features = model.text_encoder(prompts_flat, tokenized_prompts_flat)
+                text_features = text_features.view(bs, n_cls, -1)
+                
+                # 归一化
+                image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
+                text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
+                
+                # 计算 logits
+                logit_scale = model.logit_scale.exp()
+                logits = logit_scale * torch.einsum("bd,bnd->bn", image_features_norm, text_features_norm)
+                
+                # 计算损失（最大化交叉熵 = 找到最强攻击）
+                loss = F.cross_entropy(logits, labels)
+            
+            # 反向传播
+            loss.backward()
+            grad = delta.grad.detach().sign()
+            
+            # 更新扰动
+            delta = (delta.detach() + alpha * grad).clamp(-eps_val, eps_val)
+            delta = torch.clamp(images + delta, 0, 1) - images
+        
+        # 恢复模型状态
+        model.prompt_learner.use_standard_odeint = original_use_standard
+        if was_training:
+            model.prompt_learner.train()
+        
+        # 清理 PGD 攻击过程中的显存缓存
+        torch.cuda.empty_cache()
+        
+        # 生成最终对抗样本
+        adv_images_final = (images + delta.detach()).clamp(0, 1)
+        adv_normalized_final = self.normalizer.normalize(adv_images_final)
+        
+        # 获取对抗嵌入（用于训练）
+        with torch.no_grad():
+            adv_embedding = model.image_encoder(adv_normalized_final.type(dtype))
+        
+        return adv_normalized_final, adv_embedding
+    
+    def forward_backward_realtime_adv(self, batch):
+        """
+        使用实时生成的对抗样本进行训练
+        
+        流程:
+        1. 获取干净图像的 embedding（PGD 攻击前）
+        2. 对当前 batch 的图像进行 PGD 攻击（攻击完整模型）
+        3. 使用对抗嵌入训练 ODE 网络
+        4. 可选：混合干净嵌入损失
+        """
+        images = batch["img"].to(self.device)
+        labels = batch["label"].to(self.device)
+        
+        # 获取模型
+        model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        dtype = model.dtype
+        
+        # 确保 normalizer 已初始化
+        if not hasattr(self, 'normalizer'):
+            from utils.adv_utils import ImageNormalizer
+            self.normalizer = ImageNormalizer(device=self.device)
+        
+        # 确保 image_encoder 在 GPU 上
+        model.image_encoder.to(self.device)
+        model.image_encoder.eval()
+        
+        # 获取攻击参数
+        num_iters = getattr(self.cfg.TRAINER.ADV, 'REALTIME_PGD_ITERS', 10)
+        eps = self.cfg.DATASET.TRAIN_EPS
+        use_loss_mix = getattr(self.cfg.TRAINER.ADV, 'REALTIME_LOSS_MIX', True)
+        
+        # Step 0: 先获取干净 embedding（在 PGD 攻击前，避免显存压力）
+        clean_embedding = None
+        if use_loss_mix:
+            images_normalized = self.normalizer.normalize(images)
+            with torch.no_grad():
+                clean_embedding = model.image_encoder(images_normalized.type(dtype))
+        
+        # Step 1: 实时 PGD 攻击
+        _, adv_embedding = self.pgd_attack_realtime(images, labels, num_iters=num_iters, eps=eps)
+        
+        # Step 2: 使用对抗嵌入计算对抗损失
+        output_adv = model.forward_embedding(adv_embedding)
+        loss_adv = F.cross_entropy(output_adv, labels)
+        
+        # Step 3: 可选的干净损失混合
+        if use_loss_mix and clean_embedding is not None:
+            output_clean = model.forward_embedding(clean_embedding)
+            loss_clean = F.cross_entropy(output_clean, labels)
+            
+            # 混合损失
+            loss = 0.4 * loss_adv + 0.6 * loss_clean
+        else:
+            loss = loss_adv
+        
+        # 检查 loss 是否有效
+        if not torch.isfinite(loss):
+            print("[WARN] Non-finite loss detected; skip update for this batch")
+            loss_summary = {
+                "loss": loss.item(),
+                "acc": compute_accuracy(output_adv, labels)[0].item(),
+            }
+            return loss_summary
+        
+        # Step 4: 反向传播 + 梯度裁剪 + 更新
+        self.model_zero_grad()
+        loss.backward()
+        
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        torch.nn.utils.clip_grad_norm_(
+            model.prompt_learner.parameters(),
+            max_norm=1.0
+        )
+        
+        self.model_update()
+        
+        loss_summary = {
+            "loss": loss.item(),
+            "loss_adv": loss_adv.item(),
+            "acc": compute_accuracy(output_adv, labels)[0].item(),
+        }
+        
+        if use_loss_mix:
+            loss_summary["loss_clean"] = loss_clean.item()
+            loss_summary["acc_clean"] = compute_accuracy(output_clean, labels)[0].item()
+        
+        if (self.batch_idx + 1) == self.num_batches:
+            if self.cfg.OPTIM.LR_SCHEDULER != "plateau":
+                self.update_lr()
+        
+        return loss_summary

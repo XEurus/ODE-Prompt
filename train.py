@@ -182,14 +182,24 @@ def extend_cfg(cfg):
     cfg.TRAINER.ADV.CTX_INIT = ""                 # 初始化词语（空则使用默认"a photo of a"）
     cfg.TRAINER.ADV.PREC = prec                   # 计算精度
     cfg.TRAINER.ADV.CLASS_TOKEN_POSITION = "end"  # 类别token位置
+    
+    # ODE 网络配置
+    # 网络类型: mlp, mlp_spectral, resnet, resnet_spectral
+    cfg.TRAINER.ADV.ODE_NETWORK_TYPE = "resnet"
+    cfg.TRAINER.ADV.ODE_T = 1.0                   # ODE 时间范围终点 T（从 0 积分到 T）
+    
+    # 实时对抗训练配置
+    cfg.TRAINER.ADV.REALTIME_LOSS_MIX = True      # 实时对抗训练时是否混合干净损失
+    cfg.TRAINER.ADV.REALTIME_PGD_ITERS = 10       # 实时对抗训练的 PGD 迭代次数（默认较少以提高速度）
 
     # 数据集和数据加载配置
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"         # 子采样策略：all/base/new
     cfg.DATALOADER.TRAIN_X.BATCH_EMBEDDING_SIZE = 256  # 嵌入bank的batch大小
+    cfg.DATALOADER.TRAIN_X.BATCH_PGD_SIZE = 64    # PGD-bank生成时的batch大小（可以更大，充分利用显存）
     cfg.DATASET.TRAIN_EPS = 16                    # 训练扰动强度（16/255 ≈ 0.063）
     cfg.DATASET.TEST_EPS = 16                     # 测试扰动强度（16/255 ≈ 0.063）
-    cfg.DATASET.Train_PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
-    cfg.DATASET.Test_PGD_NUM_ITERS = 40                # PGD攻击迭代次数（训练和测试统一）
+    cfg.DATASET.Train_PGD_NUM_ITERS = 60                # PGD攻击迭代次数（训练和测试统一）
+    cfg.DATASET.Test_PGD_NUM_ITERS = 60                # PGD攻击迭代次数（训练和测试统一）
 
     cfg.MODEL.FILE_PREFIX = "model"               # 模型文件名前缀
     cfg.NOTE = ""                                  # 训练备注
@@ -325,22 +335,37 @@ def main(args):
 
     # ========== 训练模式 ==========
     elif not args.no_train:
-        if args.adv_training:
+        if args.realtime_adv:
+            # 实时对抗训练模式：每个 batch 实时进行 PGD 攻击，攻击目标包括 ODE
+            print('=' * 60)
+            print('Starting REALTIME adversarial training...')
+            print('PGD attack will be performed on each batch, targeting the full model (including ODE)')
+            print('Validation: realtime PGD100 eps=1/255 (same as final test)')
+            print('Test: SKIPPED (too slow for realtime attack)')
+            print('=' * 60 + '\n')
+            
+            # 实时模式不预计算任何对抗样本
+            # 验证集和测试集都在 after_epoch 中实时攻击
+            
+            trainer.train(path=args.path, adv_training=False, realtime_adv=True)
+        
+        elif args.adv_training:
             print('=' * 60)
             print('Preparing adversarial training data...')
             print('=' * 60)
             
-            print('\n[1/4] Generating/Loading training adversarial embeddings...')
-            trainer.before_adv_train(path=args.path, attack='PGD')
-            
-            print('\n[2/4] Generating/Loading training clean embeddings (for mixed training)...')
+            attack_mode = args.white_attack
+            print('\n[1/4] Generating/Loading training clean embeddings (for mixed training)...')
             trainer.before_clean_train(path=args.path)
             
-            print('\n[3/4] Generating/Loading validation adversarial embeddings...')
-            trainer.before_adv_val(path=args.path, attack='PGD')
+            print(f'\n[2/4] Generating/Loading training adversarial embeddings ({attack_mode})...')
+            trainer.before_adv_train(path=args.path, attack=attack_mode)
             
-            print('\n[4/4] Generating/Loading test adversarial samples...')
-            trainer.before_adv_test(path=args.path, attack='PGD')
+            print(f'\n[3/4] Generating/Loading validation adversarial embeddings ({attack_mode})...')
+            trainer.before_adv_val(path=args.path, attack=attack_mode)
+            
+            print(f'\n[4/4] Generating/Loading test adversarial samples ({attack_mode})...')
+            trainer.before_adv_test(path=args.path, attack=attack_mode)
             
             print('=' * 60)
             print('Starting adversarial training...')
@@ -379,41 +404,89 @@ def main(args):
 
 
 if __name__ == "__main__":
+    # ==================== 默认参数配置（直接运行时使用） ====================
+    # 修改这里的默认值即可直接 python train.py 调试，也兼容 sh 脚本传参覆盖
+    DEFAULTS = {
+        # 路径配置
+        "root": "/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data",
+        "output_dir": "./output/oxford_pets/AdvPT/vit_b16/adv",
+        "path": "./pkl_data_mix_PGD5_1/",
+        
+        # 配置文件
+        "config_file": "configs/trainers/AdvPT/vit_b16.yaml",
+        "dataset_config_file": "configs/datasets/oxford_pets.yaml",
+        
+        # 模型设置
+        "trainer": "AdvPT",
+        "backbone": "",
+        "head": "",
+        "model_file": "2_layer_resnet_model.pth.tar-100",
+        
+        # 评估配置
+        "model_dir": "./output/oxford_pets/AdvPT/vit_b16/adv",
+        "load_epoch": None,
+        
+        # 攻击方法
+        "black_attack": "RAP",
+        "white_attack": "PGD",
+        
+        # 其他
+        "resume": "",
+        "seed": 1,
+        "note": "",
+        
+        # === 布尔开关（直接运行时的默认值） ===
+        "adv_training": True,   # 启用对抗训练
+        "realtime_adv": False,  # 使用实时对抗训练（每 batch 实时 PGD）
+        "no_train": False,      # 不训练
+        "eval_only": False,     # 白盒评估模式
+        "eval_black": False,    # 黑盒评估模式
+    }
+    # ================================================================
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="/root/autodl-tmp/ODE-Adversarial-Prompt-Tuning/Data", help="path to dataset")
-    parser.add_argument("--output-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv", help="output directory")
-    parser.add_argument("--path", type=str, default="./pkl_data_mix_5/", help="directory of pkl")
+    # 路径配置
+    parser.add_argument("--root", type=str, default=DEFAULTS["root"], help="path to dataset")
+    parser.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"], help="output directory")
+    parser.add_argument("--path", type=str, default=DEFAULTS["path"], help="directory of pkl")
     
     # 训练控制
-    parser.add_argument("--adv-training", action="store_true", default=True, help="启用对抗训练（使用对抗样本增强训练）")
-    parser.add_argument("--no-train", action="store_true", help="do not call trainer.train()")
-    parser.add_argument("--resume", type=str, default="",help="checkpoint directory (from which the training resumes)")
+    parser.add_argument("--adv-training", action="store_true", default=DEFAULTS["adv_training"], help="启用对抗训练")
+    parser.add_argument("--no-adv-training", action="store_true", help="禁用对抗训练")
+    parser.add_argument("--realtime-adv", action="store_true", default=DEFAULTS["realtime_adv"], help="使用实时对抗训练（每 batch 实时 PGD，攻击包括 ODE）")
+    parser.add_argument("--no-train", action="store_true", default=DEFAULTS["no_train"], help="do not call trainer.train()")
+    parser.add_argument("--resume", type=str, default=DEFAULTS["resume"], help="checkpoint directory")
     
     # 配置文件
-    parser.add_argument("--config-file", type=str, default="configs/trainers/AdvPT/vit_b16.yaml", help="path to config file")
-    parser.add_argument("--dataset-config-file", type=str, default="configs/datasets/oxford_pets.yaml",help="path to config file for dataset setup")
+    parser.add_argument("--config-file", type=str, default=DEFAULTS["config_file"], help="path to config file")
+    parser.add_argument("--dataset-config-file", type=str, default=DEFAULTS["dataset_config_file"], help="path to dataset config")
     
     # 模型设置
-    parser.add_argument("--trainer", type=str, default="AdvPT", help="name of trainer")
-    parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
-    parser.add_argument("--head", type=str, default="", help="name of head")
-    parser.add_argument("--model-file", type=str, default="2_layer_resnet_model.pth.tar-100", help="name of model file")
+    parser.add_argument("--trainer", type=str, default=DEFAULTS["trainer"], help="name of trainer")
+    parser.add_argument("--backbone", type=str, default=DEFAULTS["backbone"], help="name of CNN backbone")
+    parser.add_argument("--head", type=str, default=DEFAULTS["head"], help="name of head")
+    parser.add_argument("--model-file", type=str, default=DEFAULTS["model_file"], help="name of model file")
+    
     # 评估模式
-    parser.add_argument("--eval-only", action="store_true", help="evaluation only (白盒攻击)")
-    parser.add_argument("--eval-black", action="store_true", help="evaluation black-box attack")
-    parser.add_argument("--model-dir", type=str, default="./output/oxford_pets/AdvPT/vit_b16/adv",help="load model from this directory for eval-only mode")
-    parser.add_argument("--load-epoch", type=int, help="load model weights at this epoch for evaluation")
+    parser.add_argument("--eval-only", action="store_true", default=DEFAULTS["eval_only"], help="白盒攻击评估")
+    parser.add_argument("--eval-black", action="store_true", default=DEFAULTS["eval_black"], help="黑盒攻击评估")
+    parser.add_argument("--model-dir", type=str, default=DEFAULTS["model_dir"], help="model directory for eval")
+    parser.add_argument("--load-epoch", type=int, default=DEFAULTS["load_epoch"], help="load model at this epoch")
     
     # 攻击方法选择
-    parser.add_argument("--black-attack", type=str, default="RAP",help="黑盒攻击方法: RAP, SIA 等")
-    parser.add_argument("--white-attack", type=str, default="PGD",help="白盒攻击方法: PGD, FGSM 等")
+    parser.add_argument("--black-attack", type=str, default=DEFAULTS["black_attack"], help="黑盒攻击方法: RAP, SIA")
+    parser.add_argument("--white-attack", type=str, default=DEFAULTS["white_attack"], help="白盒攻击方法: PGD, FGSM")
     
     # 额外配置
-    parser.add_argument("opts", default=None, nargs=argparse.REMAINDER,help="modify config options using the command-line")
-    parser.add_argument("--seed", type=int, default=1, help="only positive value enables a fixed seed")
-    parser.add_argument("--note", type=str, default="", help="training note/remark for experiment tracking")
+    parser.add_argument("opts", default=None, nargs=argparse.REMAINDER, help="modify config options")
+    parser.add_argument("--seed", type=int, default=DEFAULTS["seed"], help="random seed")
+    parser.add_argument("--note", type=str, default=DEFAULTS["note"], help="training note")
     
     args = parser.parse_args()
+    
+    # 处理 --no-adv-training 覆盖
+    if args.no_adv_training:
+        args.adv_training = False
 
     # 启动主程序
     print("DEBUG: args.eval_only =", args.eval_only)
