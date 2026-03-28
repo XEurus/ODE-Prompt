@@ -187,6 +187,10 @@ def extend_cfg(cfg):
     # 网络类型: mlp, mlp_spectral, resnet, resnet_spectral
     cfg.TRAINER.ADV.ODE_NETWORK_TYPE = "resnet"
     cfg.TRAINER.ADV.ODE_T = 1.0                   # ODE 时间范围终点 T（从 0 积分到 T）
+    
+    # 实时对抗训练配置
+    cfg.TRAINER.ADV.REALTIME_LOSS_MIX = True      # 实时对抗训练时是否混合干净损失
+    cfg.TRAINER.ADV.REALTIME_PGD_ITERS = 10       # 实时对抗训练的 PGD 迭代次数（默认较少以提高速度）
 
     # 数据集和数据加载配置
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"         # 子采样策略：all/base/new
@@ -331,7 +335,21 @@ def main(args):
 
     # ========== 训练模式 ==========
     elif not args.no_train:
-        if args.adv_training:
+        if args.realtime_adv:
+            # 实时对抗训练模式：每个 batch 实时进行 PGD 攻击，攻击目标包括 ODE
+            print('=' * 60)
+            print('Starting REALTIME adversarial training...')
+            print('PGD attack will be performed on each batch, targeting the full model (including ODE)')
+            print('Validation: realtime PGD100 eps=1/255 (same as final test)')
+            print('Test: SKIPPED (too slow for realtime attack)')
+            print('=' * 60 + '\n')
+            
+            # 实时模式不预计算任何对抗样本
+            # 验证集和测试集都在 after_epoch 中实时攻击
+            
+            trainer.train(path=args.path, adv_training=False, realtime_adv=True)
+        
+        elif args.adv_training:
             print('=' * 60)
             print('Preparing adversarial training data...')
             print('=' * 60)
@@ -419,6 +437,7 @@ if __name__ == "__main__":
         
         # === 布尔开关（直接运行时的默认值） ===
         "adv_training": True,   # 启用对抗训练
+        "realtime_adv": False,  # 使用实时对抗训练（每 batch 实时 PGD）
         "no_train": False,      # 不训练
         "eval_only": False,     # 白盒评估模式
         "eval_black": False,    # 黑盒评估模式
@@ -434,6 +453,7 @@ if __name__ == "__main__":
     # 训练控制
     parser.add_argument("--adv-training", action="store_true", default=DEFAULTS["adv_training"], help="启用对抗训练")
     parser.add_argument("--no-adv-training", action="store_true", help="禁用对抗训练")
+    parser.add_argument("--realtime-adv", action="store_true", default=DEFAULTS["realtime_adv"], help="使用实时对抗训练（每 batch 实时 PGD，攻击包括 ODE）")
     parser.add_argument("--no-train", action="store_true", default=DEFAULTS["no_train"], help="do not call trainer.train()")
     parser.add_argument("--resume", type=str, default=DEFAULTS["resume"], help="checkpoint directory")
     

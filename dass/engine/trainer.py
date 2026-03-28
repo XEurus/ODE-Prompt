@@ -304,20 +304,31 @@ class TrainerBase:
         else:
             self._writer.add_scalar(tag, scalar_value, global_step)
 
-    def train(self, start_epoch, max_epoch, path=None, adv_training=False):
+    def train(self, start_epoch, max_epoch, path=None, adv_training=False, realtime_adv=False):
         """
         通用的训练循环。
+        
+        参数:
+            start_epoch: 起始 epoch
+            max_epoch: 最大 epoch 数
+            path: pkl 数据路径
+            adv_training: 是否使用对抗训练（预计算 bank）
+            realtime_adv: 是否使用实时对抗训练（每 batch 实时 PGD）
         """
         self.start_epoch = start_epoch
         self.max_epoch = max_epoch
+        self.realtime_adv = realtime_adv  # 保存到实例变量
         print("adv_training: ", adv_training)
+        print("realtime_adv: ", realtime_adv)
         self.before_train()
         # if adv_training:
         #     # 如果是对抗训练，进行预处理（例如生成对抗样本）
         #     self.before_adv_train(path=path)
         for self.epoch in range(self.start_epoch, self.max_epoch):
             self.before_epoch() # 每个epoch前的钩子
-            if adv_training:
+            if realtime_adv:
+                self.run_epoch_realtime_adv()  # 运行实时对抗训练的 epoch
+            elif adv_training:
                 self.run_epoch_adv() # 运行对抗训练的epoch
             else:
                 self.run_epoch() # 运行普通训练的epoch
@@ -476,11 +487,16 @@ class SimpleTrainer(TrainerBase):
             print(f"Detected {device_count} GPUs (use nn.DataParallel)")
             self.model = nn.DataParallel(self.model)
 
-    def train(self,path=None, adv_training=False):
+    def train(self,path=None, adv_training=False, realtime_adv=False):
         """
         调用父类的train方法开始训练。
+        
+        参数:
+            path: pkl 数据路径
+            adv_training: 是否使用对抗训练（预计算 bank）
+            realtime_adv: 是否使用实时对抗训练
         """
-        super().train(self.start_epoch, self.max_epoch, path=path, adv_training=adv_training)
+        super().train(self.start_epoch, self.max_epoch, path=path, adv_training=adv_training, realtime_adv=realtime_adv)
 
     def before_train(self):
         """
@@ -1566,6 +1582,82 @@ class TrainerX(SimpleTrainer):
         # 保存 epoch 级训练准确率，供 after_epoch 使用（避免重新评估）
         if "acc" in losses.meters:
             self._epoch_train_acc = losses.meters["acc"].avg
+
+    def run_epoch_realtime_adv(self):
+        """
+        运行实时对抗训练的一个 epoch
+        
+        与 run_epoch_adv 的区别：
+        - run_epoch_adv: 使用预计算的 embedding bank
+        - run_epoch_realtime_adv: 每个 batch 实时进行 PGD 攻击
+        
+        这种方式更慢，但攻击目标包括正在训练的 ODE 网络，
+        因此能生成更强的对抗样本。
+        """
+        self.set_model_mode("train")
+        losses = MetricMeter()
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        
+        # 使用不带归一化的 DataLoader，因为 PGD 攻击需要 [0,1] 像素空间图像
+        data_loader = self.train_loader_x_notransform_noshuffle
+        self.num_batches = len(data_loader)
+
+        end = time.time()
+        for self.batch_idx, batch in enumerate(data_loader):
+            data_time.update(time.time() - end)
+            
+            # 调用实时对抗训练方法
+            loss_summary = self.forward_backward_realtime_adv(batch)
+            
+            batch_time.update(time.time() - end)
+            losses.update(loss_summary)
+
+            # 日志记录
+            meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
+            only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
+            if meet_freq or only_few_batches:
+                nb_remain = 0
+                nb_remain += self.num_batches - self.batch_idx - 1
+                nb_remain += (
+                                     self.max_epoch - self.epoch - 1
+                             ) * self.num_batches
+                eta_seconds = batch_time.avg * nb_remain
+                eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+
+                info = []
+                info += [f"epoch [{self.epoch + 1}/{self.max_epoch}]"]
+                info += [f"batch [{self.batch_idx + 1}/{self.num_batches}]"]
+                info += [f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"]
+                info += [f"data {data_time.val:.3f} ({data_time.avg:.3f})"]
+                info += [f"{losses}"]
+                info += [f"lr {self.get_current_lr():.4e}"]
+                info += [f"eta {eta}"]
+                print(" ".join(info))
+
+            n_iter = self.epoch * self.num_batches + self.batch_idx
+            for name, meter in losses.meters.items():
+                self.write_scalar("train/" + name, meter.avg, n_iter)
+            self.write_scalar("train/lr", self.get_current_lr(), n_iter)
+
+            end = time.time()
+
+        # epoch 级聚合指标
+        for name, meter in losses.meters.items():
+            self.write_scalar("epoch_train/" + name, meter.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/lr", self.get_current_lr(), self.epoch + 1)
+        self.write_scalar("epoch_train/batch_time_avg", batch_time.avg, self.epoch + 1)
+        self.write_scalar("epoch_train/data_time_avg", data_time.avg, self.epoch + 1)
+
+        # 保存 epoch 级训练准确率
+        if "acc" in losses.meters:
+            self._epoch_train_acc = losses.meters["acc"].avg
+
+    def forward_backward_realtime_adv(self, batch):
+        """
+        实时对抗训练的默认实现（应由子类重写）
+        """
+        raise NotImplementedError("Subclass must implement forward_backward_realtime_adv")
 
     def parse_batch_train(self, batch):
         input = batch["img"]

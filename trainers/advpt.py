@@ -824,73 +824,89 @@ class AdvPT(TrainerX):
 
     def after_epoch(self):
         """
-        每个 epoch 结束后进行验证（仅使用对抗数据）
+        每个 epoch 结束后进行验证
         
         显示：
         1. 训练集对抗准确率
         2. 验证集对抗准确率
+        
+        实时模式：
+        - 验证集使用实时 PGD100 eps=1/255 攻击
+        - 跳过测试集评估（太慢）
         """
         last_epoch = (self.epoch + 1) == self.max_epoch
         do_test = not self.cfg.TEST.NO_TEST
+        is_realtime = getattr(self, 'realtime_adv', False) or getattr(self.cfg, 'realtime_adv', False)
         
         if not do_test:
             return
         
         print(f"\n{'='*60}")
         print(f"Epoch {self.epoch + 1}/{self.max_epoch} - Adversarial Validation")
+        if is_realtime:
+            print(f"[Realtime Mode] Val: PGD100 eps=1/255 | Test: SKIPPED")
         print(f"{'='*60}")
         
         # 获取每个 epoch 测试的 batch 数量
         max_batches = getattr(self.cfg.TEST, 'EPOCH_TEST_BATCHES', 2)
-        partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
         
-        # 1. 训练集对抗准确率 - 直接使用 run_epoch_adv 中统计的平均值（避免重新遍历）
+        # 1. 训练集对抗准确率 - 直接使用 run_epoch_adv 中统计的平均值
         train_acc = getattr(self, '_epoch_train_acc', None)
         if train_acc is not None:
             print(f'\n[1/2] Train Adversarial Accuracy (from training):')
             print(f"      Train Adv Acc: {train_acc:.2f}%")
         else:
-            print(f'\n[1/2] Train adversarial accuracy not available (no acc in loss_summary)')
+            print(f'\n[1/2] Train adversarial accuracy not available')
         
         # 2. 验证集对抗准确率
         val_acc = None
         val_loss = None
-        if hasattr(self, 'val_pkl') and self.val_pkl is not None:
-            print(f'\n[2/2] Validation Adversarial Accuracy:')
-            val_acc = self._eval_adv_embedding(
-                self.val_pkl,
-                self.val_loader,
-                max_batches=max_batches
-            )
-            print(f"      Val Adv Acc: {val_acc:.2f}%")
-            # if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-            val_loss = self._eval_adv_embedding_loss(
-                self.val_pkl,
-                self.val_loader,
-                max_batches=max_batches
-            )
-        elif hasattr(self, 'test_pkl') and self.test_pkl is not None:
-            # 如果没有验证集对抗嵌入，使用测试集
-            print(f'\n[2/2] Test Adversarial Accuracy (no val_pkl):')
-            val_acc = self.test_adv_partial(split="test", max_batches=max_batches)
-            print(f"      Test Adv Acc: {val_acc:.2f}%")
-            #if self.cfg.OPTIM.LR_SCHEDULER == "plateau":
-            val_loss = self._eval_adv_embedding_loss(
-                self.test_pkl,
-                self.test_loader,
-                max_batches=max_batches
-            )
+        
+        if is_realtime:
+            # 实时模式：对验证集进行实时 PGD 攻击
+            print(f'\n[2/2] Validation Adversarial Accuracy (Realtime PGD100 eps=1/255):')
+            val_acc, val_loss = self._eval_realtime_adv_val(max_batches=max_batches)
+            if val_acc is not None:
+                print(f"      Val Adv Acc: {val_acc:.2f}%")
+            else:
+                print(f"      Val Adv Acc: N/A (no val_loader)")
         else:
-            print(f'\n[2/2] Validation adversarial test skipped')
+            # Bank 模式：使用预计算的 embedding
+            if hasattr(self, 'val_pkl') and self.val_pkl is not None:
+                print(f'\n[2/2] Validation Adversarial Accuracy:')
+                val_acc = self._eval_adv_embedding(
+                    self.val_pkl,
+                    self.val_loader,
+                    max_batches=max_batches
+                )
+                print(f"      Val Adv Acc: {val_acc:.2f}%")
+                val_loss = self._eval_adv_embedding_loss(
+                    self.val_pkl,
+                    self.val_loader,
+                    max_batches=max_batches
+                )
+            elif hasattr(self, 'test_pkl') and self.test_pkl is not None:
+                print(f'\n[2/2] Test Adversarial Accuracy (no val_pkl):')
+                val_acc = self.test_adv_partial(split="test", max_batches=max_batches)
+                print(f"      Test Adv Acc: {val_acc:.2f}%")
+                val_loss = self._eval_adv_embedding_loss(
+                    self.test_pkl,
+                    self.test_loader,
+                    max_batches=max_batches
+                )
+            else:
+                print(f'\n[2/2] Validation adversarial test skipped')
 
-        # 3. 每个 epoch 额外评估部分 test（用于观察 val/test 偏差）
+        # 3. 测试集评估（实时模式跳过）
         test_partial_acc = None
-        if hasattr(self, 'test_pkl') and self.test_pkl is not None:
-            print(f'\n[Extra] Partial Test Adversarial Accuracy ({partial_test_batches} batches):')
-            test_partial_acc = self.test_adv_partial(split="test", max_batches=partial_test_batches)
-            print(f"      Test Partial Adv Acc: {test_partial_acc:.2f}%")
-        else:
-            print(f'\n[Extra] Partial test adversarial evaluation skipped (test_pkl not prepared)')
+        if not is_realtime:
+            partial_test_batches = getattr(self.cfg.TEST, 'PARTIAL_TEST_BATCHES', 10)
+            if hasattr(self, 'test_pkl') and self.test_pkl is not None:
+                print(f'\n[Extra] Partial Test Adversarial Accuracy ({partial_test_batches} batches):')
+                test_partial_acc = self.test_adv_partial(split="test", max_batches=partial_test_batches)
+                print(f"      Test Partial Adv Acc: {test_partial_acc:.2f}%")
+            else:
+                print(f'\n[Extra] Partial test adversarial evaluation skipped')
         
         # 打印摘要
         summary_parts = []
@@ -899,7 +915,7 @@ class AdvPT(TrainerX):
         if val_acc is not None:
             summary_parts.append(f"Val: {val_acc:.2f}%")
         if test_partial_acc is not None:
-            summary_parts.append(f"Test@{partial_test_batches}b: {test_partial_acc:.2f}%")
+            summary_parts.append(f"Test: {test_partial_acc:.2f}%")
         if summary_parts:
             print(f"\n[Summary] {' | '.join(summary_parts)}")
         
@@ -912,12 +928,8 @@ class AdvPT(TrainerX):
             self.write_scalar("epoch/val_adv_loss", val_loss, self.epoch)
         if test_partial_acc is not None:
             self.write_scalar("epoch/test_partial_adv_acc", test_partial_acc, self.epoch)
-        if val_acc is not None and test_partial_acc is not None:
-            gap = val_acc - test_partial_acc
-            #self.write_scalar("epoch/val_test_gap", gap, self.epoch)
-            self.write_scalar("epoch/val_test_gap_abs", abs(gap), self.epoch)
 
-        # 统一打印一行结构化指标，便于日志解析/画图
+        # 统一打印一行结构化指标
         print(
             f"[EpochMetrics] epoch={self.epoch + 1} "
             f"train_adv_acc={train_acc if train_acc is not None else 'NA'} "
@@ -925,11 +937,11 @@ class AdvPT(TrainerX):
             f"test_partial_adv_acc={test_partial_acc if test_partial_acc is not None else 'NA'}"
         )
 
-        # 使用验证集损失驱动学习率调整（ReduceLROnPlateau）
+        # 使用验证集损失驱动学习率调整
         if self.cfg.OPTIM.LR_SCHEDULER == "plateau" and val_loss is not None:
             self.sched.step(val_loss)
         
-        # 保存最佳模型（基于验证集对抗准确率）
+        # 保存最佳模型
         if val_acc is not None:
             is_best = val_acc > self.best_result
             if is_best:
@@ -956,6 +968,121 @@ class AdvPT(TrainerX):
             print(f"[Checkpoint Saved] Epoch {self.epoch + 1}")
         
         print(f"{'='*60}\n")
+    
+    def _eval_realtime_adv_val(self, max_batches=None):
+        """
+        实时对验证集进行 PGD 攻击并评估
+        
+        攻击参数（与最终测试一致）：
+        - PGD100 迭代
+        - eps = 1/255
+        
+        返回:
+            val_acc: 验证集对抗准确率
+            val_loss: 验证集对抗损失
+        """
+        if self.val_loader is None:
+            return None, None
+        
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+        
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        dtype = model.dtype
+        
+        # 确保 normalizer 已初始化
+        if not hasattr(self, 'normalizer'):
+            from utils.adv_utils import ImageNormalizer
+            self.normalizer = ImageNormalizer(device=self.device)
+        
+        # 使用不带归一化的验证集 DataLoader
+        val_loader = getattr(self, 'val_loader_notransform', None)
+        if val_loader is None:
+            val_loader = self.val_loader
+            print("      [WARN] val_loader_notransform not found, using val_loader")
+        
+        # 攻击参数：与最终测试一致
+        num_iters = 100  # PGD100
+        eps = 1  # 1/255
+        eps_val = eps / 255.0
+        alpha = eps_val / 4  # 步长 = eps / 4
+        
+        # 确保 image_encoder 在 GPU 上
+        model.image_encoder.to(self.device)
+        model.image_encoder.eval()
+        model.text_encoder.eval()
+        model.prompt_learner.eval()
+        
+        # 临时切换到标准 odeint
+        original_use_standard = getattr(model.prompt_learner, 'use_standard_odeint', False)
+        model.prompt_learner.use_standard_odeint = True
+        
+        total_loss = 0.0
+        total_count = 0
+        
+        for batch_idx, batch in enumerate(val_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+            
+            images = batch["img"].to(self.device)
+            labels = batch["label"].to(self.device)
+            
+            # PGD 攻击
+            delta = torch.zeros_like(images).uniform_(-eps_val, eps_val)
+            delta = torch.clamp(images + delta, 0, 1) - images
+            
+            for _ in range(num_iters):
+                delta.requires_grad_(True)
+                adv_images = images + delta
+                adv_normalized = self.normalizer.normalize(adv_images)
+                
+                with torch.enable_grad():
+                    image_features = model.image_encoder(adv_normalized.type(dtype))
+                    prompts = model.prompt_learner(image_features)
+                    
+                    bs, n_cls, n_ctx, dim = prompts.shape
+                    prompts_flat = prompts.reshape(bs * n_cls, n_ctx, dim)
+                    tokenized_prompts = model.tokenized_prompts
+                    tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
+                    
+                    text_features = model.text_encoder(prompts_flat, tokenized_prompts_flat)
+                    text_features = text_features.view(bs, n_cls, -1)
+                    
+                    image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
+                    text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
+                    
+                    logit_scale = model.logit_scale.exp()
+                    logits = logit_scale * torch.einsum("bd,bnd->bn", image_features_norm, text_features_norm)
+                    
+                    loss = F.cross_entropy(logits, labels)
+                
+                loss.backward()
+                grad = delta.grad.detach().sign()
+                delta = (delta.detach() + alpha * grad).clamp(-eps_val, eps_val)
+                delta = torch.clamp(images + delta, 0, 1) - images
+            
+            # 最终评估
+            adv_images_final = (images + delta.detach()).clamp(0, 1)
+            adv_normalized_final = self.normalizer.normalize(adv_images_final)
+            
+            with torch.no_grad():
+                adv_embedding = model.image_encoder(adv_normalized_final.type(dtype))
+                output = model.forward_embedding(adv_embedding)
+                
+                loss_val = F.cross_entropy(output, labels, reduction="sum")
+                total_loss += loss_val.item()
+                total_count += labels.shape[0]
+            
+            self.evaluator.process(output, labels)
+        
+        # 恢复模型状态
+        model.prompt_learner.use_standard_odeint = original_use_standard
+        
+        results = self.evaluator.evaluate()
+        val_acc = list(results.values())[0]
+        val_loss = total_loss / total_count if total_count > 0 else None
+        
+        return val_acc, val_loss
 
     @torch.no_grad()
     def _eval_adv_embedding(self, embedding_pkl, data_loader, max_batches=None):
@@ -1302,3 +1429,212 @@ class AdvPT(TrainerX):
             print("[Verify] ODE network layer statistics:")
             for layer_name, param in ode_func.named_parameters():
                 print(f"  - {layer_name}: shape={list(param.shape)}, mean={param.mean().item():.6f}, std={param.std().item():.6f}")
+
+    # =========================================================================
+    # 实时对抗训练相关方法
+    # =========================================================================
+    
+    def pgd_attack_realtime(self, images, labels, num_iters=None, eps=None):
+        """
+        实时 PGD 攻击：对完整模型（包括 ODE 网络）进行白盒攻击
+        
+        注意：每个 batch 只进行一次 PGD 攻击，不像 bank 模式那样多次 restart
+        
+        参数:
+            images: 原始图像，形状 (batch_size, 3, H, W)，像素范围 [0, 1]
+            labels: 标签，形状 (batch_size,)
+            num_iters: PGD 迭代次数
+            eps: 扰动强度（像素值 /255）
+        
+        返回:
+            adv_images: 对抗图像，形状 (batch_size, 3, H, W)，已归一化
+            adv_embedding: 对抗图像的嵌入，形状 (batch_size, dim)
+        """
+        if num_iters is None:
+            num_iters = getattr(self.cfg.TRAINER.ADV, 'REALTIME_PGD_ITERS', 10)
+        if eps is None:
+            eps = self.cfg.DATASET.TRAIN_EPS
+        
+        eps_val = eps / 255.0
+        alpha = eps_val / num_iters * 2.5  # 步长
+        
+        # 获取模型
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        dtype = model.dtype
+        
+        # 确保 normalizer 已初始化
+        if not hasattr(self, 'normalizer'):
+            from utils.adv_utils import ImageNormalizer
+            self.normalizer = ImageNormalizer(device=self.device)
+        
+        # 确保 image_encoder 在 GPU 上
+        model.image_encoder.to(self.device)
+        model.image_encoder.eval()
+        model.text_encoder.eval()
+        
+        # 保存 ODE 网络原始状态
+        was_training = model.prompt_learner.training
+        # 攻击时使用 eval 模式，确保 ODE 行为一致
+        model.prompt_learner.eval()
+        
+        # 临时切换到标准 odeint（攻击时不需要 adjoint 反向传播）
+        original_use_standard = getattr(model.prompt_learner, 'use_standard_odeint', False)
+        model.prompt_learner.use_standard_odeint = True
+        
+        # 初始化扰动
+        delta = torch.zeros_like(images).uniform_(-eps_val, eps_val)
+        delta = torch.clamp(images + delta, 0, 1) - images
+        
+        # PGD 攻击循环
+        for _ in range(num_iters):
+            delta.requires_grad_(True)
+            
+            # 生成对抗图像并归一化
+            adv_images = images + delta
+            adv_normalized = self.normalizer.normalize(adv_images)
+            
+            # 前向传播：通过完整模型
+            with torch.enable_grad():
+                # 获取对抗图像的嵌入
+                image_features = model.image_encoder(adv_normalized.type(dtype))
+                
+                # 通过 ODE 演化提示并计算 logits
+                prompts = model.prompt_learner(image_features)
+                
+                # 编码提示
+                bs, n_cls, n_ctx, dim = prompts.shape
+                prompts_flat = prompts.reshape(bs * n_cls, n_ctx, dim)
+                tokenized_prompts = model.tokenized_prompts
+                tokenized_prompts_flat = tokenized_prompts.unsqueeze(0).expand(bs, -1, -1).reshape(bs * n_cls, -1)
+                
+                text_features = model.text_encoder(prompts_flat, tokenized_prompts_flat)
+                text_features = text_features.view(bs, n_cls, -1)
+                
+                # 归一化
+                image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
+                text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
+                
+                # 计算 logits
+                logit_scale = model.logit_scale.exp()
+                logits = logit_scale * torch.einsum("bd,bnd->bn", image_features_norm, text_features_norm)
+                
+                # 计算损失（最大化交叉熵 = 找到最强攻击）
+                loss = F.cross_entropy(logits, labels)
+            
+            # 反向传播
+            loss.backward()
+            grad = delta.grad.detach().sign()
+            
+            # 更新扰动
+            delta = (delta.detach() + alpha * grad).clamp(-eps_val, eps_val)
+            delta = torch.clamp(images + delta, 0, 1) - images
+        
+        # 恢复模型状态
+        model.prompt_learner.use_standard_odeint = original_use_standard
+        if was_training:
+            model.prompt_learner.train()
+        
+        # 清理 PGD 攻击过程中的显存缓存
+        torch.cuda.empty_cache()
+        
+        # 生成最终对抗样本
+        adv_images_final = (images + delta.detach()).clamp(0, 1)
+        adv_normalized_final = self.normalizer.normalize(adv_images_final)
+        
+        # 获取对抗嵌入（用于训练）
+        with torch.no_grad():
+            adv_embedding = model.image_encoder(adv_normalized_final.type(dtype))
+        
+        return adv_normalized_final, adv_embedding
+    
+    def forward_backward_realtime_adv(self, batch):
+        """
+        使用实时生成的对抗样本进行训练
+        
+        流程:
+        1. 获取干净图像的 embedding（PGD 攻击前）
+        2. 对当前 batch 的图像进行 PGD 攻击（攻击完整模型）
+        3. 使用对抗嵌入训练 ODE 网络
+        4. 可选：混合干净嵌入损失
+        """
+        images = batch["img"].to(self.device)
+        labels = batch["label"].to(self.device)
+        
+        # 获取模型
+        model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        dtype = model.dtype
+        
+        # 确保 normalizer 已初始化
+        if not hasattr(self, 'normalizer'):
+            from utils.adv_utils import ImageNormalizer
+            self.normalizer = ImageNormalizer(device=self.device)
+        
+        # 确保 image_encoder 在 GPU 上
+        model.image_encoder.to(self.device)
+        model.image_encoder.eval()
+        
+        # 获取攻击参数
+        num_iters = getattr(self.cfg.TRAINER.ADV, 'REALTIME_PGD_ITERS', 10)
+        eps = self.cfg.DATASET.TRAIN_EPS
+        use_loss_mix = getattr(self.cfg.TRAINER.ADV, 'REALTIME_LOSS_MIX', True)
+        
+        # Step 0: 先获取干净 embedding（在 PGD 攻击前，避免显存压力）
+        clean_embedding = None
+        if use_loss_mix:
+            images_normalized = self.normalizer.normalize(images)
+            with torch.no_grad():
+                clean_embedding = model.image_encoder(images_normalized.type(dtype))
+        
+        # Step 1: 实时 PGD 攻击
+        _, adv_embedding = self.pgd_attack_realtime(images, labels, num_iters=num_iters, eps=eps)
+        
+        # Step 2: 使用对抗嵌入计算对抗损失
+        output_adv = model.forward_embedding(adv_embedding)
+        loss_adv = F.cross_entropy(output_adv, labels)
+        
+        # Step 3: 可选的干净损失混合
+        if use_loss_mix and clean_embedding is not None:
+            output_clean = model.forward_embedding(clean_embedding)
+            loss_clean = F.cross_entropy(output_clean, labels)
+            
+            # 混合损失
+            loss = 0.4 * loss_adv + 0.6 * loss_clean
+        else:
+            loss = loss_adv
+        
+        # 检查 loss 是否有效
+        if not torch.isfinite(loss):
+            print("[WARN] Non-finite loss detected; skip update for this batch")
+            loss_summary = {
+                "loss": loss.item(),
+                "acc": compute_accuracy(output_adv, labels)[0].item(),
+            }
+            return loss_summary
+        
+        # Step 4: 反向传播 + 梯度裁剪 + 更新
+        self.model_zero_grad()
+        loss.backward()
+        
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        torch.nn.utils.clip_grad_norm_(
+            model.prompt_learner.parameters(),
+            max_norm=1.0
+        )
+        
+        self.model_update()
+        
+        loss_summary = {
+            "loss": loss.item(),
+            "loss_adv": loss_adv.item(),
+            "acc": compute_accuracy(output_adv, labels)[0].item(),
+        }
+        
+        if use_loss_mix:
+            loss_summary["loss_clean"] = loss_clean.item()
+            loss_summary["acc_clean"] = compute_accuracy(output_clean, labels)[0].item()
+        
+        if (self.batch_idx + 1) == self.num_batches:
+            if self.cfg.OPTIM.LR_SCHEDULER != "plateau":
+                self.update_lr()
+        
+        return loss_summary
