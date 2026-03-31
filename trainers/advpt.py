@@ -1231,7 +1231,18 @@ class AdvPT(TrainerX):
             self.evaluator.process(output, label)
 
         results = self.evaluator.evaluate()
-        return list(results.values())[0]
+        acc = list(results.values())[0]
+        
+        # 完整鲁棒测试时记录到 TensorBoard（与父类 test() 行为一致）
+        # max_batches=None 表示是完整测试（最终评估），而非训练中的部分测试
+        # 干净测试走父类 test() 方法，已有记录逻辑，这里只记录鲁棒测试
+        if use_adv and max_batches is None and hasattr(self, 'max_epoch'):
+            final_step = getattr(self, 'max_epoch', self.epoch)
+            for k, v in results.items():
+                tag = f"{split}/{k}"
+                self.write_scalar(tag, v, final_step)
+        
+        return acc
 
     @torch.no_grad()
     def test_partial(self, split=None, max_batches=20):

@@ -27,7 +27,8 @@ CTP=end
 PREC=fp16
 
 # ==================== ODE 网络配置 ====================
-ODE_NETWORK_TYPE="resnet_Spectral"
+# 定义要测试的 ODE 网络类型列表
+ODE_NETWORK_TYPES=("resnet" "resnet_spectral")
 ODE_T=1.0
 
 # ==================== 训练模式配置 ====================
@@ -54,12 +55,21 @@ NUM_SHOTS=16                 # Few-shot: 每类训练样本数 (-1=全部)
 TRAIN_BATCH_SIZE=24           # 实时模式建议 4（显存压力大），bank 模式可用 8
 
 # ==================== 实验配置 ====================
+# 遍历所有 ODE 网络类型
+for ODE_NETWORK_TYPE in "${ODE_NETWORK_TYPES[@]}"; do
+
+echo ""
+echo "######################################################################"
+echo "开始训练 ODE 网络类型: ${ODE_NETWORK_TYPE}"
+echo "######################################################################"
+echo ""
+
 if [ "$TRAINING_MODE" = "realtime" ]; then
     exp_name="11_realtime_${NUM_SHOTS}shot_${ODE_NETWORK_TYPE}_pgd${REALTIME_PGD_ITERS}_eps${TRAIN_EPS}"
     TRAINING_NOTE="实时对抗训练: train=realtime-PGD${REALTIME_PGD_ITERS}-${TRAIN_EPS}/255, test=PGD${TEST_PGD_ITERS}-${TEST_EPS}/255"
 else
-    exp_name="10_bank_1e5_${NUM_SHOTS}shot_${ODE_NETWORK_TYPE}_pgd${TRAIN_PGD_ITERS}_eps${TRAIN_EPS}_epoch5_${ODE_T}"
-    TRAINING_NOTE="Bank对抗训练,进行谱归一化"
+    exp_name="10_epoch30_bank_${NUM_SHOTS}shot_${ODE_NETWORK_TYPE}_pgd${TRAIN_PGD_ITERS}_eps${TRAIN_EPS}_${ODE_T}"
+    TRAINING_NOTE="Bank对抗训练,再次测试"
 fi
 
 # 模型文件
@@ -173,7 +183,7 @@ fi
 
 echo ""
 echo "======================================================================"
-echo "训练完成"
+echo "训练完成: ${ODE_NETWORK_TYPE}"
 echo "======================================================================"
 
 # 发送邮件通知
@@ -182,6 +192,14 @@ $PYTHON utils/email_sender.py \
     --exp_name "${exp_name}" \
     --log_file ${LOG_FILE}
 
-# sleep 300
-# shutdown -h now
+done  # 结束 ODE_NETWORK_TYPE 循环
+
+echo ""
+echo "######################################################################"
+echo "所有 ODE 网络类型训练完成!"
+echo "测试的网络类型: ${ODE_NETWORK_TYPES[*]}"
+echo "######################################################################"
+
+sleep 300
+shutdown -h now
 
