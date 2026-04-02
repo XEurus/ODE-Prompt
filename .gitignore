@@ -136,3 +136,5 @@ debug.sh
 
 *.pt
 *.pkl
+*.png
+ATTACK_MODES_EXPLAINED.md
